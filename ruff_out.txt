@@ -1,0 +1,49 @@
+F841 Local variable `fee_cost` is assigned to but never used
+   --> app\execution\trader.py:113:17
+    |
+111 |                 fill_qty = float(order.get("filled", quantity))
+112 |                 fee_info = order.get("fee", {})
+113 |                 fee_cost = float(fee_info.get("cost", 0)) if fee_info else 0.0
+    |                 ^^^^^^^^
+114 |
+115 |                 logger.info(
+    |
+help: Remove assignment to unused variable `fee_cost`
+
+F401 `vectorbt` imported but unused; consider using `importlib.util.find_spec` to test for availability
+  --> backtests\grid_backtest.py:13:24
+   |
+12 | try:
+13 |     import vectorbt as vbt
+   |                        ^^^
+14 |     HAS_VBT = True
+15 | except ImportError:
+   |
+help: Remove unused import: `vectorbt`
+
+F541 [*] f-string without any placeholders
+   --> backtests\grid_backtest.py:171:11
+    |
+169 |             print(f"  {k}: {v}")
+170 |
+171 |     print(f"\n--- OVERFIT CHECK ---")
+    |           ^^^^^^^^^^^^^^^^^^^^^^^^^^
+172 |     for k, v in result["overfit_check"].items():
+173 |         print(f"  {k}: {v}%")
+    |
+help: Remove extraneous `f` prefix
+
+F541 [*] f-string without any placeholders
+   --> backtests\pair_backtest.py:182:11
+    |
+180 |             print(f"  {k}: {v}")
+181 |
+182 |     print(f"\n--- OVERFIT CHECK ---")
+    |           ^^^^^^^^^^^^^^^^^^^^^^^^^^
+183 |     for k, v in result["overfit_check"].items():
+184 |         print(f"  {k}: {v}%")
+    |
+help: Remove extraneous `f` prefix
+
+Found 4 errors.
+[*] 2 fixable with the `--fix` option (1 hidden fix can be enabled with the `--unsafe-fixes` option).
