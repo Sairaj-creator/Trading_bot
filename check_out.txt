@@ -1,0 +1,4 @@
+Current Market Price of BNB: $611.6
+Total open limit orders waiting: 7
+The closest order is a buy at: $590.67
+The market price needs to drop by $20.93 for this order to execute and trigger the Telegram message.

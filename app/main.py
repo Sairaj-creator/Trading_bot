@@ -59,7 +59,7 @@ async def lifespan(app: FastAPI):
     # Execution layer
     signal_bus = SignalBus(cooldown_seconds=settings.COOLDOWN_SECONDS)
     trader = Trader(fetcher.exchange)
-    order_tracker = OrderTracker(fetcher.exchange, poll_interval=5.0)
+    order_tracker = OrderTracker(fetcher.exchange, poll_interval=30.0)
     risk_manager = RiskManager()
 
     # Strategy
