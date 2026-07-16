@@ -194,16 +194,21 @@ async def _on_order_filled(filled_order: dict) -> None:
         if side == "buy":
             await grid_bot.on_buy_filled(filled_order)
             if filled_order.get("grid_level") is not None:
-                risk_manager.register_position(filled_order["symbol"], filled_order["grid_level"], filled_order["price"])
+                risk_manager.register_position(
+                    filled_order["symbol"], 
+                    filled_order["grid_level"], 
+                    filled_order["price"], 
+                    filled_order["quantity"]
+                )
         elif side == "sell":
             cycle_pnl = await grid_bot.on_sell_filled(filled_order)
             if cycle_pnl:
                 risk_manager.record_trade_result(cycle_pnl)
             if filled_order.get("grid_level") is not None:
                 # Decrement open notional based on entry price since position is now closed
-                entry_price = risk_manager.state.open_positions.get((filled_order["symbol"], filled_order["grid_level"]))
-                if entry_price:
-                    risk_manager.decrement_open_notional(entry_price * filled_order.get("quantity", 0.0))
+                pos_data = risk_manager.state.open_positions.get((filled_order["symbol"], filled_order["grid_level"]))
+                if pos_data:
+                    risk_manager.decrement_open_notional(pos_data["entry_price"] * pos_data["quantity"])
                 risk_manager.close_position(filled_order["symbol"], filled_order["grid_level"])
 
 
@@ -224,55 +229,97 @@ async def _candle_update_job() -> None:
         if exit_dir:
             logger.warning("Price exited grid {} — rebalancing.", exit_dir)
             
-            # Close stranded inventory before rebalance
-            for (sym, level_id), entry_price in list(risk_manager.state.open_positions.items()):
+            # Close stranded inventory before rebalance using concurrent awaits
+            liquidation_tasks = []
+            positions_to_close = []
+            
+            for (sym, level_id), pos_data in list(risk_manager.state.open_positions.items()):
                 if sym == symbol:
-                    # Calculate original quantity
-                    qty = grid_bot.capital_per_grid / entry_price
+                    entry_price = pos_data["entry_price"]
+                    qty = pos_data["quantity"]
                     logger.info("Closing stranded position for {} level {} (entry: {:.4f}) at market.", sym, level_id, entry_price)
-                    signal = TradeSignal(
-                        priority=SignalPriority.STOP_LOSS,
-                        timestamp=time.time(),
+                    
+                    positions_to_close.append((sym, level_id, entry_price, qty))
+                    liquidation_tasks.append(trader.create_order(
                         symbol=sym,
                         side="sell",
                         order_type="market",
-                        price=price,
                         quantity=round(qty, 6),
-                        strategy="grid_bot",
-                        grid_level=level_id,
-                    )
-                    await signal_bus.push(signal)
+                        price=price
+                    ))
+            
+            if liquidation_tasks:
+                results = await asyncio.gather(*liquidation_tasks)
+                liquidation_failed = False
+                
+                for i, order in enumerate(results):
+                    sym, level_id, entry_price, qty = positions_to_close[i]
                     
-                    # Synchronously close position and release notional to prevent leaks
-                    risk_manager.decrement_open_notional(entry_price * round(qty, 6))
-                    risk_manager.close_position(sym, level_id)
-
+                    if order and order.get("id"):
+                        # Calculate and record PnL
+                        fill_price = float(order.get("average") or order.get("price") or price)
+                        filled_qty = float(order.get("filled") or qty)
+                        fee = float(order.get("fee", {}).get("cost", 0.0) if order.get("fee") else 0.0)
+                        
+                        pnl = (fill_price - entry_price) * filled_qty - fee
+                        risk_manager.record_trade_result(pnl)
+                        logger.info("Stranded position {} level {} liquidated. PnL: ${:.4f}", sym, level_id, pnl)
+                        
+                        # Note: For DB persistence, the Trade model should ideally be saved here.
+                        # Since DB is stubbed, we leave this as a deliberate no-op for now.
+                        
+                        # Synchronously close position and release notional
+                        risk_manager.decrement_open_notional(entry_price * round(qty, 6))
+                        risk_manager.close_position(sym, level_id)
+                    else:
+                        logger.error("Failed to liquidate stranded position for {} level {}", sym, level_id)
+                        liquidation_failed = True
+                        
+                if liquidation_failed:
+                    logger.warning("Rebalance aborted due to liquidation failure. Will retry on next update.")
+                    return  # Abort rebalance so positions aren't stranded without sell orders
+            
             await grid_bot.rebalance(price, trader)
 
-        # Check stop-loss on open positions
-        stop_results = risk_manager.check_stop_loss(symbol, price)
-        for level_id, triggered, pct in stop_results:
-            if triggered and level_id < len(grid_bot.state.levels):
-                level = grid_bot.state.levels[level_id]
-                qty = grid_bot.capital_per_grid / level.price
-                signal = TradeSignal(
-                    priority=SignalPriority.STOP_LOSS,
-                    timestamp=time.time(),
-                    symbol=symbol,
-                    side="sell",
-                    order_type="market",
-                    price=price,
-                    quantity=round(qty, 6),
-                    strategy="grid_bot",
-                    grid_level=level_id,
-                )
-                await signal_bus.push(signal)
-                
-                # Synchronously close position and release notional
-                entry_price = risk_manager.state.open_positions.get((symbol, level_id))
-                if entry_price:
-                    risk_manager.decrement_open_notional(entry_price * round(qty, 6))
-                risk_manager.close_position(symbol, level_id)
+        # Stop-loss check
+        sl_positions = risk_manager.check_stop_loss(price, symbol)
+        if sl_positions:
+            sl_tasks = []
+            sl_meta = []
+            
+            for (sym, level_id) in sl_positions:
+                pos_data = risk_manager.state.open_positions.get((sym, level_id))
+                if pos_data:
+                    entry_price = pos_data["entry_price"]
+                    qty = pos_data["quantity"]
+                    logger.warning("Stop-loss triggered for {} level {} (entry: {:.4f})", sym, level_id, entry_price)
+                    
+                    sl_meta.append((sym, level_id, entry_price, qty))
+                    sl_tasks.append(trader.create_order(
+                        symbol=sym,
+                        side="sell",
+                        order_type="market",
+                        quantity=round(qty, 6),
+                        price=price
+                    ))
+            
+            if sl_tasks:
+                results = await asyncio.gather(*sl_tasks)
+                for i, order in enumerate(results):
+                    sym, level_id, entry_price, qty = sl_meta[i]
+                    if order and order.get("id"):
+                        # Calculate and record PnL
+                        fill_price = float(order.get("average") or order.get("price") or price)
+                        filled_qty = float(order.get("filled") or qty)
+                        fee = float(order.get("fee", {}).get("cost", 0.0) if order.get("fee") else 0.0)
+                        
+                        pnl = (fill_price - entry_price) * filled_qty - fee
+                        risk_manager.record_trade_result(pnl)
+                        
+                        risk_manager.decrement_open_notional(entry_price * round(qty, 6))
+                        risk_manager.close_position(sym, level_id)
+                    else:
+                        logger.error("Failed to execute stop-loss for {} level {}", symbol, level_id)
 
 
 async def _stale_check_job() -> None:

@@ -8,13 +8,20 @@ from __future__ import annotations
 
 import asyncio
 from datetime import datetime, timezone
+from typing import Callable
 
 import ccxt.async_support as ccxt
 from loguru import logger
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.utils.notifier import notify_trade
-from database.models import Trade, TradeSide, TradeStatus, OrderType, StrategyName
+from database.models import (
+    OrderType,
+    StrategyName,
+    Trade,
+    TradeSide,
+    TradeStatus,
+)
 
 
 class OrderTracker:
@@ -32,11 +39,11 @@ class OrderTracker:
         self.exchange = exchange
         self.poll_interval = poll_interval
         self._tracked_orders: dict[str, dict] = {}  # order_id -> order_info
-        self._on_fill_callbacks: list[callable] = []
+        self._on_fill_callbacks: list[Callable] = []
         self._running = False
-        self.on_cancel_cb = on_cancel_cb
+        self.on_cancel_cb: Callable | None = on_cancel_cb
 
-    def on_fill(self, callback) -> None:
+    def on_fill(self, callback: Callable) -> None:
         """Register a callback to be invoked when an order is filled."""
         self._on_fill_callbacks.append(callback)
 

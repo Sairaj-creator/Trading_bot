@@ -80,6 +80,10 @@ async def test_stranded_inventory_liquidated_on_rebalance():
          patch("app.main.fetcher") as mock_fetcher:
         
         mock_fetcher.get_current_price = AsyncMock(return_value=120.0)
+        mock_fetcher.fetch_latest_candle = AsyncMock()
+        mock_trader.create_order = AsyncMock(return_value={"id": "mock_id"})
+        mock_sb.push = AsyncMock()
+        mock_grid.rebalance = AsyncMock()
         mock_grid.state.active = True
         mock_grid.state.grid_low = 80.0
         mock_grid.state.grid_high = 110.0
@@ -89,7 +93,7 @@ async def test_stranded_inventory_liquidated_on_rebalance():
         mock_rm.check_grid_range_exit.return_value = "above"
         
         # Simulate 1 open position
-        mock_rm.state.open_positions = {("BNB/USDT", 2): 100.0}
+        mock_rm.state.open_positions = {("BNB/USDT", 2): {"entry_price": 100.0, "quantity": 1.0}}
         mock_rm.check_stop_loss.return_value = []
         
         from app.main import _candle_update_job
@@ -98,16 +102,57 @@ async def test_stranded_inventory_liquidated_on_rebalance():
         
         await _candle_update_job()
         
-        # Verify market sell signal was pushed
-        assert mock_sb.push.call_count == 1
-        signal = mock_sb.push.call_args[0][0]
-        assert signal.side == "sell"
-        assert signal.order_type == "market"
-        assert signal.price == 120.0
-        assert signal.quantity == 1.0  # 100 capital / 100 entry_price
+        
+        # Verify direct awaited execution
+        assert mock_trader.create_order.call_count == 1
+        call_kwargs = mock_trader.create_order.call_args[1]
+        assert call_kwargs["symbol"] == "BNB/USDT"
+        assert call_kwargs["side"] == "sell"
+        assert call_kwargs["order_type"] == "market"
+        assert call_kwargs["price"] == 120.0
+        assert call_kwargs["quantity"] == 1.0  # 100 capital / 100 entry_price
         
         # Verify synchronous cleanup
         mock_rm.decrement_open_notional.assert_called_once_with(100.0 * 1.0)
         mock_rm.close_position.assert_called_once_with("BNB/USDT", 2)
         mock_grid.rebalance.assert_called_once_with(120.0, mock_trader)
+
+@pytest.mark.asyncio
+async def test_stranded_inventory_liquidation_failure_retains_position():
+    """Test that if a liquidation sell fails, the position remains registered for next time."""
+    with patch("app.main.risk_manager") as mock_rm, \
+         patch("app.main.grid_bot") as mock_grid, \
+         patch("app.main.trader") as mock_trader, \
+         patch("app.main.fetcher") as mock_fetcher:
+        
+        mock_fetcher.get_current_price = AsyncMock(return_value=120.0)
+        mock_fetcher.fetch_latest_candle = AsyncMock()
+        mock_grid.rebalance = AsyncMock()
+        mock_grid.state.active = True
+        mock_grid.state.grid_low = 80.0
+        mock_grid.state.grid_high = 110.0
+        mock_grid.capital_per_grid = 100.0
+        
+        mock_rm.check_grid_range_exit.return_value = "above"
+        mock_rm.state.open_positions = {("BNB/USDT", 2): {"entry_price": 100.0, "quantity": 1.0}}
+        mock_rm.check_stop_loss.return_value = []
+        
+        # Simulate create_order failure (returns None)
+        mock_trader.create_order = AsyncMock(return_value=None)
+        
+        from app.main import _candle_update_job
+        import app.config as settings
+        settings.TRADING_PAIR = "BNB/USDT"
+        
+        await _candle_update_job()
+        
+        # Verify order was attempted
+        assert mock_trader.create_order.call_count == 1
+        
+        # Verify position was NOT released/closed
+        mock_rm.decrement_open_notional.assert_not_called()
+        mock_rm.close_position.assert_not_called()
+        
+        # Rebalance should be aborted
+        mock_grid.rebalance.assert_not_called()
 

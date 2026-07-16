@@ -25,7 +25,7 @@ class RiskState:
     consecutive_losses: int = 0
     circuit_broken: bool = False
     circuit_break_until: datetime | None = None
-    open_positions: dict = field(default_factory=dict)  # (symbol, grid_level) -> entry_price
+    open_positions: dict = field(default_factory=dict)  # (symbol, grid_level) -> {"entry_price": float, "quantity": float}
     open_notional: float = 0.0
 
 
@@ -70,7 +70,10 @@ class RiskManager:
             else:
                 return False, "Circuit breaker active (no expiry set)"
 
-        # Max capital per trade (20% default) - only block buys to avoid stranding inventory
+        # Max capital per trade (20% default) 
+        # Note: We intentionally only block `buy` orders here. Sells are inherently risk-reducing.
+        # Blocking a sell would strand inventory. Tradeoff: any future bug generating an oversized
+        # sell quantity will not be caught by this check before reaching the exchange.
         trade_cost = quantity * price
         max_allowed = current_balance * settings.MAX_TRADE_PCT
         if side == "buy" and trade_cost > max_allowed:
@@ -164,17 +167,19 @@ class RiskManager:
         Returns a list of (grid_level, triggered, loss_pct).
         """
         results = []
-        for (sym, level_id), entry_price in self.state.open_positions.items():
+        for (sym, level_id), pos_data in self.state.open_positions.items():
             if sym == symbol:
+                entry_price = pos_data["entry_price"]
                 loss_pct = (entry_price - current_price) / entry_price
-                triggered = loss_pct >= settings.STOP_LOSS_PCT
-                if triggered:
+                if loss_pct >= settings.STOP_LOSS_PCT:
                     logger.warning(
                         "STOP-LOSS triggered for {} level {} at {:.2%} (limit {:.2%})",
                         symbol, level_id, loss_pct, settings.STOP_LOSS_PCT,
                     )
                     asyncio.ensure_future(notify_stop_loss(f"{symbol} level {level_id}", loss_pct))
-                results.append((level_id, triggered, loss_pct))
+                    results.append((level_id, True, loss_pct))
+                else:
+                    results.append((level_id, False, loss_pct))
         return results
 
     def check_take_profit(
@@ -185,22 +190,27 @@ class RiskManager:
         Returns a list of (grid_level, triggered, gain_pct).
         """
         results = []
-        for (sym, level_id), entry_price in self.state.open_positions.items():
+        for (sym, level_id), pos_data in self.state.open_positions.items():
             if sym == symbol:
+                entry_price = pos_data["entry_price"]
                 gain_pct = (current_price - entry_price) / entry_price
-                triggered = gain_pct >= settings.TAKE_PROFIT_PCT
-                if triggered:
+                if gain_pct >= settings.TAKE_PROFIT_PCT:
                     logger.info("TAKE-PROFIT for {} level {} at {:.2%}", symbol, level_id, gain_pct)
-                results.append((level_id, triggered, gain_pct))
+                    results.append((level_id, True, gain_pct))
+                else:
+                    results.append((level_id, False, gain_pct))
         return results
 
     # ------------------------------------------------------------------
     # Position tracking
     # ------------------------------------------------------------------
 
-    def register_position(self, symbol: str, grid_level: int, entry_price: float) -> None:
+    def register_position(self, symbol: str, grid_level: int, entry_price: float, quantity: float) -> None:
         """Track a new open position per grid level."""
-        self.state.open_positions[(symbol, grid_level)] = entry_price
+        self.state.open_positions[(symbol, grid_level)] = {
+            "entry_price": entry_price,
+            "quantity": quantity
+        }
 
     def close_position(self, symbol: str, grid_level: int) -> None:
         """Remove a closed position from tracking."""

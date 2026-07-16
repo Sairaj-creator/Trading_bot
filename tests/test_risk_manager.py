@@ -50,11 +50,23 @@ class TestPreTradeChecks:
         absolute balance check since 20% < 100%. The trade is still
         correctly blocked — the risk manager prevents overleveraging.
         """
-        allowed, reason = self.rm.check_trade_allowed(
-            "BNB/USDT", "buy", 1.0, 600.0, 50.0,
+        allowed, msg = self.rm.check_trade_allowed(
+            "BNB/USDT", "buy", 2.1, 100.0, 1000.0
         )
-        assert allowed is False
-        assert "exceeds max" in reason
+        assert not allowed
+        assert "exceeds max" in msg
+
+    def test_check_trade_allowed_ignores_sell_quantity(self):
+        """Test that MAX_TRADE_PCT does not apply to sells, even if oversized."""
+        with patch("app.risk.risk_manager.settings") as ms:
+            ms.MAX_TRADE_PCT = 0.20
+            # 5.0 * 100 = $500, which is 50% of balance (exceeds 20% cap)
+            # But because it's a sell, it should be allowed
+            allowed, msg = self.rm.check_trade_allowed(
+                "BNB/USDT", "sell", 5.0, 100.0, 1000.0
+            )
+        assert allowed is True
+        assert msg == "OK"
 
     def test_circuit_broken_rejects_trade(self):
         """No trades should pass when circuit breaker is active."""
@@ -117,8 +129,8 @@ class TestStopLoss:
 
     def test_stop_loss_triggers(self):
         """Stop-loss should trigger at 2% adverse move for specific level."""
-        self.rm.register_position("BNB/USDT", 1, 600.0)
-        self.rm.register_position("BNB/USDT", 2, 550.0)
+        self.rm.register_position("BNB/USDT", 1, 600.0, 1.0)
+        self.rm.register_position("BNB/USDT", 2, 550.0, 1.0)
         with patch("app.risk.risk_manager.settings") as ms:
             ms.STOP_LOSS_PCT = 0.02
             # 586 is < 600 * 0.98, so level 1 triggers. But 586 > 550, so level 2 does not.
@@ -134,7 +146,7 @@ class TestStopLoss:
 
     def test_stop_loss_not_triggered(self):
         """Price within tolerance should not trigger stop-loss."""
-        self.rm.register_position("BNB/USDT", 1, 600.0)
+        self.rm.register_position("BNB/USDT", 1, 600.0, 1.0)
         with patch("app.risk.risk_manager.settings") as ms:
             ms.STOP_LOSS_PCT = 0.02
             results = self.rm.check_stop_loss("BNB/USDT", 595.0)
@@ -162,7 +174,7 @@ class TestTakeProfit:
 
     def test_take_profit_triggers(self):
         """Take-profit should trigger at 3%+ gain."""
-        self.rm.register_position("BNB/USDT", 1, 600.0)
+        self.rm.register_position("BNB/USDT", 1, 600.0, 1.0)
         with patch("app.risk.risk_manager.settings") as ms:
             ms.TAKE_PROFIT_PCT = 0.03
             results = self.rm.check_take_profit("BNB/USDT", 620.0)
