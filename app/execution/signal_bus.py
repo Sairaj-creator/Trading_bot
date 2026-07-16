@@ -36,6 +36,7 @@ class TradeSignal:
     quantity: float = field(compare=False, default=0.0)
     strategy: str = field(compare=False, default="grid_bot")
     signal_id: str = field(compare=False, default="")
+    grid_level: int | None = field(compare=False, default=None)
 
     def __post_init__(self) -> None:
         if not self.signal_id:
@@ -59,8 +60,8 @@ class SignalBus:
         return self._queue.qsize()
 
     def _dedup_key(self, signal: TradeSignal) -> str:
-        """Create a deduplication key from symbol + side + strategy."""
-        return f"{signal.symbol}:{signal.side}:{signal.strategy}"
+        """Create a deduplication key from symbol + side + strategy + price."""
+        return f"{signal.symbol}:{signal.side}:{signal.strategy}:{signal.price}"
 
     def _is_duplicate(self, signal: TradeSignal) -> bool:
         """Check if an identical signal was sent within the cooldown window."""

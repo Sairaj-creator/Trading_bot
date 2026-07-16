@@ -4,11 +4,10 @@ Production-grade automated cryptocurrency trading system for **Binance Spot** wi
 
 ## Strategies
 
-| Strategy | Edge | Best Market |
-|----------|------|-------------|
-| **Grid Trading** (Primary) | Mathematical range profit | Sideways / Ranging |
-| **Funding Rate Arb** | Structural rate harvest | High funding periods |
-| **Stat Pair Trading** | Statistical mean reversion | Correlated pair divergence |
+### Included Strategies
+1. **Grid Trading**: Core enabled strategy. Divides a price range into intervals, buys low and sells high automatically.
+2. **Long-Spot Funding Momentum**: (Implemented, not yet enabled in live event loop). Rides funding rate momentum. *Note: Not currently delta-neutral as hedge leg is not implemented.*
+3. **Statistical Pair Trading**: (Implemented, not yet enabled in live event loop). Mean-reversion based pair trading.
 
 ## Quick Start
 

@@ -45,8 +45,9 @@ class Trader:
     Distinguishes between retryable (network) and fatal (logic) errors.
     """
 
-    def __init__(self, exchange: ccxt.binance) -> None:
+    def __init__(self, exchange: ccxt.Exchange, on_cancel_cb=None) -> None:
         self.exchange = exchange
+        self.on_cancel_cb = on_cancel_cb
 
     # ------------------------------------------------------------------
     # Fee-aware order sizing
@@ -188,6 +189,19 @@ class Trader:
         try:
             await self.exchange.cancel_order(order_id, symbol)
             logger.info("Cancelled order {} for {}.", order_id, symbol)
+            if self.on_cancel_cb:
+                if asyncio.iscoroutinefunction(self.on_cancel_cb):
+                    await self.on_cancel_cb(order_id)
+                else:
+                    self.on_cancel_cb(order_id)
+            return True
+        except ccxt.OrderNotFound:
+            logger.info("Order {} already closed/cancelled.", order_id)
+            if self.on_cancel_cb:
+                if asyncio.iscoroutinefunction(self.on_cancel_cb):
+                    await self.on_cancel_cb(order_id)
+                else:
+                    self.on_cancel_cb(order_id)
             return True
         except _FATAL_ERRORS as exc:
             logger.error("Cannot cancel order {}: {}", order_id, exc)
@@ -205,12 +219,16 @@ class Trader:
         """Cancel all open orders for a symbol. Returns count cancelled."""
         try:
             orders = await self.exchange.fetch_open_orders(symbol)
-            cancelled = 0
-            for order in orders:
-                if await self.cancel_order(order["id"], symbol):
-                    cancelled += 1
-            logger.info("Cancelled {}/{} orders for {}.", cancelled, len(orders), symbol)
-            return cancelled
         except ccxt.BaseError as exc:
             logger.error("Failed to fetch open orders for {}: {}", symbol, exc)
             return 0
+            
+        cancelled = 0
+        for order in orders:
+            try:
+                if await self.cancel_order(order["id"], symbol):
+                    cancelled += 1
+            except ccxt.BaseError as exc:
+                logger.error("Error cancelling order {}: {}", order["id"], exc)
+        logger.info("Cancelled {}/{} orders for {}.", cancelled, len(orders), symbol)
+        return cancelled

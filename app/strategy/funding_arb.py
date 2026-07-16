@@ -1,7 +1,7 @@
 """
-SmartTrade AI Bot — Funding Rate Arbitrage Strategy
-Delta-neutral position: long spot + short perp futures.
-Collects funding rate payments when rate is strongly positive.
+SmartTrade AI Bot — Long-Spot Funding Momentum Strategy
+Naked long spot position. Collects funding rate momentum when rate is strongly positive.
+WARNING: This is NOT delta-neutral. The futures hedge leg is currently not implemented.
 """
 
 from __future__ import annotations
@@ -46,9 +46,9 @@ def annualize_funding_rate(rate_per_period: float) -> float:
 
 class FundingArbBot:
     """
-    Funding rate arbitrage strategy.
-    When funding rate is strongly positive, shorts collect payment.
-    Delta-neutral: long spot offsets short futures exposure.
+    Long-Spot Funding Momentum Strategy.
+    When funding rate is strongly positive, longs spot to ride momentum.
+    WARNING: Not delta-neutral. Hedge leg is missing.
     """
 
     def __init__(
@@ -98,7 +98,13 @@ class FundingArbBot:
     async def _open_position(
         self, symbol: str, current_rate: float,
     ) -> bool:
-        """Open delta-neutral position: buy spot, short futures."""
+        """Open position: buy spot."""
+        # RUNTIME GUARD
+        HEDGE_LEG_IMPLEMENTED = False
+        if not HEDGE_LEG_IMPLEMENTED:
+            logger.critical("Refusing to open Funding Arb position: Hedge leg is not implemented. This would create a naked long spot position with full directional risk.")
+            return False
+
         price = await self.fetcher.get_current_price(symbol)
         if not price:
             return False

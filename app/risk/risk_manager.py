@@ -25,7 +25,8 @@ class RiskState:
     consecutive_losses: int = 0
     circuit_broken: bool = False
     circuit_break_until: datetime | None = None
-    open_positions: dict = field(default_factory=dict)  # symbol -> entry_price
+    open_positions: dict = field(default_factory=dict)  # (symbol, grid_level) -> entry_price
+    open_notional: float = 0.0
 
 
 class RiskManager:
@@ -66,22 +67,42 @@ class RiskManager:
                 self.state.circuit_broken = False
                 self.state.circuit_break_until = None
                 logger.info("Circuit breaker expired — trading resumed.")
+            else:
+                return False, "Circuit breaker active (no expiry set)"
 
-        # Max capital per trade (20% default)
+        # Max capital per trade (20% default) - only block buys to avoid stranding inventory
         trade_cost = quantity * price
         max_allowed = current_balance * settings.MAX_TRADE_PCT
-        if trade_cost > max_allowed:
+        if side == "buy" and trade_cost > max_allowed:
             return (
                 False,
                 f"Trade cost ${trade_cost:.2f} exceeds max "
                 f"${max_allowed:.2f} ({settings.MAX_TRADE_PCT:.0%} of balance)",
             )
+            
+        # Max portfolio exposure (default 85%)
+        if side == "buy" and hasattr(settings, "MAX_PORTFOLIO_EXPOSURE_PCT"):
+            max_portfolio_allowed = current_balance * settings.MAX_PORTFOLIO_EXPOSURE_PCT
+            if self.state.open_notional + trade_cost > max_portfolio_allowed:
+                return (
+                    False,
+                    f"Portfolio exposure ${self.state.open_notional + trade_cost:.2f} exceeds max "
+                    f"${max_portfolio_allowed:.2f} ({settings.MAX_PORTFOLIO_EXPOSURE_PCT:.0%} of balance)",
+                )
 
         # Balance sufficiency
         if side == "buy" and trade_cost > current_balance:
             return False, f"Insufficient balance: need ${trade_cost:.2f}, have ${current_balance:.2f}"
+            
+        # Increment open notional for the allowed trade
+        if side == "buy":
+            self.state.open_notional += trade_cost
 
         return True, "OK"
+        
+    def decrement_open_notional(self, cost: float) -> None:
+        """Decrement open notional when an order fills or is cancelled."""
+        self.state.open_notional = max(0.0, self.state.open_notional - cost)
 
     # ------------------------------------------------------------------
     # Post-trade updates
@@ -137,53 +158,53 @@ class RiskManager:
 
     def check_stop_loss(
         self, symbol: str, current_price: float,
-    ) -> tuple[bool, float]:
+    ) -> list[tuple[int, bool, float]]:
         """
-        Check if a position has breached stop-loss.
-        Returns (triggered: bool, loss_pct: float).
+        Check if any open position for the symbol has breached stop-loss.
+        Returns a list of (grid_level, triggered, loss_pct).
         """
-        entry_price = self.state.open_positions.get(symbol)
-        if entry_price is None:
-            return False, 0.0
-
-        loss_pct = (entry_price - current_price) / entry_price
-        if loss_pct >= settings.STOP_LOSS_PCT:
-            logger.warning(
-                "STOP-LOSS triggered for {} at {:.2%} (limit {:.2%})",
-                symbol, loss_pct, settings.STOP_LOSS_PCT,
-            )
-            asyncio.ensure_future(notify_stop_loss(symbol, loss_pct))
-            return True, loss_pct
-        return False, loss_pct
+        results = []
+        for (sym, level_id), entry_price in self.state.open_positions.items():
+            if sym == symbol:
+                loss_pct = (entry_price - current_price) / entry_price
+                triggered = loss_pct >= settings.STOP_LOSS_PCT
+                if triggered:
+                    logger.warning(
+                        "STOP-LOSS triggered for {} level {} at {:.2%} (limit {:.2%})",
+                        symbol, level_id, loss_pct, settings.STOP_LOSS_PCT,
+                    )
+                    asyncio.ensure_future(notify_stop_loss(f"{symbol} level {level_id}", loss_pct))
+                results.append((level_id, triggered, loss_pct))
+        return results
 
     def check_take_profit(
         self, symbol: str, current_price: float,
-    ) -> tuple[bool, float]:
+    ) -> list[tuple[int, bool, float]]:
         """
-        Check if a position has reached take-profit.
-        Returns (triggered: bool, gain_pct: float).
+        Check if any open position for the symbol has reached take-profit.
+        Returns a list of (grid_level, triggered, gain_pct).
         """
-        entry_price = self.state.open_positions.get(symbol)
-        if entry_price is None:
-            return False, 0.0
-
-        gain_pct = (current_price - entry_price) / entry_price
-        if gain_pct >= settings.TAKE_PROFIT_PCT:
-            logger.info("TAKE-PROFIT for {} at {:.2%}", symbol, gain_pct)
-            return True, gain_pct
-        return False, gain_pct
+        results = []
+        for (sym, level_id), entry_price in self.state.open_positions.items():
+            if sym == symbol:
+                gain_pct = (current_price - entry_price) / entry_price
+                triggered = gain_pct >= settings.TAKE_PROFIT_PCT
+                if triggered:
+                    logger.info("TAKE-PROFIT for {} level {} at {:.2%}", symbol, level_id, gain_pct)
+                results.append((level_id, triggered, gain_pct))
+        return results
 
     # ------------------------------------------------------------------
     # Position tracking
     # ------------------------------------------------------------------
 
-    def register_position(self, symbol: str, entry_price: float) -> None:
-        """Track a new open position."""
-        self.state.open_positions[symbol] = entry_price
+    def register_position(self, symbol: str, grid_level: int, entry_price: float) -> None:
+        """Track a new open position per grid level."""
+        self.state.open_positions[(symbol, grid_level)] = entry_price
 
-    def close_position(self, symbol: str) -> None:
+    def close_position(self, symbol: str, grid_level: int) -> None:
         """Remove a closed position from tracking."""
-        self.state.open_positions.pop(symbol, None)
+        self.state.open_positions.pop((symbol, grid_level), None)
 
     # ------------------------------------------------------------------
     # Pair trading risk (gated)

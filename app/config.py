@@ -26,6 +26,7 @@ class Settings(BaseSettings):
     TRADING_PAIR: str = "BNB/USDT"
     CAPITAL_USDT: float = 100.0
     MAX_TRADE_PCT: float = 0.20
+    MAX_PORTFOLIO_EXPOSURE_PCT: float = 0.85
     DAILY_LOSS_LIMIT_PCT: float = 0.05
     GRID_LEVELS: int = 16
     GRID_RANGE_PCT: float = 0.08
@@ -68,6 +69,18 @@ class Settings(BaseSettings):
             raise ValueError("CAPITAL_USDT must be positive.")
         if not 0 < self.MAX_TRADE_PCT <= 1:
             raise ValueError("MAX_TRADE_PCT must be between 0 and 1.")
+        if not 0 < self.MAX_PORTFOLIO_EXPOSURE_PCT <= 1:
+            raise ValueError("MAX_PORTFOLIO_EXPOSURE_PCT must be between 0 and 1.")
+        if self.MAX_PORTFOLIO_EXPOSURE_PCT <= self.MAX_TRADE_PCT:
+            raise ValueError(f"MAX_PORTFOLIO_EXPOSURE_PCT ({self.MAX_PORTFOLIO_EXPOSURE_PCT}) must be strictly greater than MAX_TRADE_PCT ({self.MAX_TRADE_PCT}).")
+        if not 0 < self.STOP_LOSS_PCT < 1:
+            raise ValueError("STOP_LOSS_PCT must be between 0 and 1.")
+        if not 0 < self.TAKE_PROFIT_PCT < 1:
+            raise ValueError("TAKE_PROFIT_PCT must be between 0 and 1.")
+        if not 0 < self.GRID_RANGE_PCT < 1:
+            raise ValueError("GRID_RANGE_PCT must be between 0 and 1.")
+        if not 0 < self.DAILY_LOSS_LIMIT_PCT < 1:
+            raise ValueError("DAILY_LOSS_LIMIT_PCT must be between 0 and 1.")
         if self.GRID_LEVELS < 2:
             raise ValueError("GRID_LEVELS must be at least 2.")
         return self

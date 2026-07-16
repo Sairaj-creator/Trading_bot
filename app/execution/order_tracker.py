@@ -25,14 +25,16 @@ class OrderTracker:
 
     def __init__(
         self,
-        exchange: ccxt.binance,
+        exchange: ccxt.Exchange,
         poll_interval: float = 5.0,
+        on_cancel_cb=None,
     ) -> None:
         self.exchange = exchange
         self.poll_interval = poll_interval
         self._tracked_orders: dict[str, dict] = {}  # order_id -> order_info
-        self._on_fill_callbacks: list = []
+        self._on_fill_callbacks: list[callable] = []
         self._running = False
+        self.on_cancel_cb = on_cancel_cb
 
     def on_fill(self, callback) -> None:
         """Register a callback to be invoked when an order is filled."""
@@ -45,6 +47,8 @@ class OrderTracker:
         side: str,
         strategy: str = "grid_bot",
         grid_level: int | None = None,
+        price: float = 0.0,
+        quantity: float = 0.0,
     ) -> None:
         """Start tracking an open order."""
         self._tracked_orders[order_id] = {
@@ -52,6 +56,8 @@ class OrderTracker:
             "side": side,
             "strategy": strategy,
             "grid_level": grid_level,
+            "price": price,
+            "quantity": quantity,
             "tracked_at": datetime.now(timezone.utc),
         }
         logger.debug("Now tracking order {} ({} {}).", order_id, symbol, side)
@@ -118,6 +124,14 @@ class OrderTracker:
             elif status == "canceled" or status == "expired":
                 to_remove.append(order_id)
                 logger.info("Order {} status: {}", order_id, status)
+                if self.on_cancel_cb:
+                    try:
+                        if asyncio.iscoroutinefunction(self.on_cancel_cb):
+                            await self.on_cancel_cb(order_id)
+                        else:
+                            self.on_cancel_cb(order_id)
+                    except Exception as exc:
+                        logger.error("Cancel callback error: {}", exc)
 
         # Cleanup completed orders
         for oid in to_remove:

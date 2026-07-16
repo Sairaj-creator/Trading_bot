@@ -129,6 +129,7 @@ class GridBot:
                     price=level.price,
                     quantity=round(quantity, 6),
                     strategy="grid_bot",
+                    grid_level=level.index,
                 )
                 if await self.signal_bus.push(signal):
                     level.has_buy_order = True
@@ -176,6 +177,7 @@ class GridBot:
             price=sell_level.price,
             quantity=round(quantity, 6),
             strategy="grid_bot",
+            grid_level=sell_level.index,
         )
 
         if await self.signal_bus.push(signal):
@@ -185,19 +187,26 @@ class GridBot:
                 sell_level.price, sell_level_idx, quantity,
             )
 
-    async def on_sell_filled(self, filled_order: dict) -> None:
+    async def on_sell_filled(self, filled_order: dict) -> float:
         """
         Callback when a grid sell order fills.
         Records the completed cycle profit and replaces the buy order.
+        Returns the calculated cycle profit.
         """
         fill_price = filled_order["price"]
         quantity = filled_order["quantity"]
 
         # Find the grid level
+        matched_level = None
         for level in self.state.levels:
             if abs(level.price - fill_price) / fill_price < 0.005:
                 level.has_sell_order = False
+                matched_level = level
                 break
+        
+        if matched_level is None:
+            logger.warning("Filled sell at {:.4f} doesn't match any grid level.", fill_price)
+            return 0.0
 
         # Calculate cycle profit (approximate — one grid interval minus fees)
         grid_interval = 0.0
@@ -215,7 +224,7 @@ class GridBot:
         )
 
         # Replace the buy order at the lower level
-        buy_level_idx = max(0, self.state.levels.index(level) - 1) if level else 0
+        buy_level_idx = max(0, matched_level.index - 1)
         if buy_level_idx < len(self.state.levels):
             buy_level = self.state.levels[buy_level_idx]
             if not buy_level.has_buy_order:
@@ -229,20 +238,26 @@ class GridBot:
                     price=buy_level.price,
                     quantity=round(qty, 6),
                     strategy="grid_bot",
+                    grid_level=buy_level.index,
                 )
                 await self.signal_bus.push(signal)
                 buy_level.has_buy_order = True
+        
+        return cycle_pnl
 
     # ------------------------------------------------------------------
     # Grid Rebalancing
     # ------------------------------------------------------------------
 
-    async def rebalance(self, current_price: float) -> None:
+    async def rebalance(self, current_price: float, trader=None) -> None:
         """
         Rebalance the grid when price has drifted significantly.
         Cancels existing orders and creates a new grid centered on current price.
         """
         logger.info("Rebalancing grid around ${:.4f}...", current_price)
+        if trader:
+            await trader.cancel_all_orders(self.state.symbol)
+            
         self.state.active = False
         # Reset all order flags
         for level in self.state.levels:

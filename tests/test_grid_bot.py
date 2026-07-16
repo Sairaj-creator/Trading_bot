@@ -9,7 +9,7 @@ from unittest.mock import patch
 
 import pytest
 
-from app.execution.signal_bus import SignalBus
+from app.execution.signal_bus import SignalBus, TradeSignal, SignalPriority
 from app.strategy.grid_bot import GridBot
 
 
@@ -100,6 +100,13 @@ class TestGridOrders:
         count = await self.bot.generate_initial_orders(600.0)
         assert count == 0
 
+    @pytest.mark.asyncio
+    async def test_on_sell_filled_unmatched_price(self):
+        """Should return 0.0 and not crash or use loop variable if price matches no level."""
+        self.bot.initialize_grid("BNB/USDT", 600.0)
+        pnl = await self.bot.on_sell_filled({"price": 9999.0, "quantity": 1.0})
+        assert pnl == 0.0
+
 
 class TestGridStatus:
     """Test status reporting."""
@@ -128,3 +135,30 @@ class TestGridStatus:
         assert status["active"] is True
         assert status["symbol"] == "BNB/USDT"
         assert status["total_levels"] == 17
+
+    @pytest.mark.asyncio
+    async def test_rebalance_cancels_old_orders(self):
+        """Rebalance should cancel existing orders via the trader."""
+        from unittest.mock import AsyncMock
+        mock_trader = AsyncMock()
+        self.bot.state.active = True
+        self.bot.state.symbol = "BNB/USDT"
+        
+        await self.bot.rebalance(300.0, trader=mock_trader)
+        
+        mock_trader.cancel_all_orders.assert_called_once_with("BNB/USDT")
+        assert self.bot.state.active is True
+
+class TestSignalBus:
+    """Test SignalBus deduplication."""
+
+    @pytest.mark.asyncio
+    async def test_dedup_with_price(self):
+        bus = SignalBus(cooldown_seconds=1)
+        # Same symbol, side, strategy but DIFFERENT price -> should NOT dedup
+        sig1 = TradeSignal(priority=SignalPriority.GRID_ORDER, timestamp=1, symbol="A", side="buy", order_type="limit", price=100.0, quantity=1, strategy="grid_bot")
+        sig2 = TradeSignal(priority=SignalPriority.GRID_ORDER, timestamp=2, symbol="A", side="buy", order_type="limit", price=101.0, quantity=1, strategy="grid_bot")
+        
+        assert await bus.push(sig1) is True
+        assert await bus.push(sig2) is True
+        assert bus.pending_count == 2

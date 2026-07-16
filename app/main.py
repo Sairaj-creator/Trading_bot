@@ -7,6 +7,7 @@ and the core trading event loop.
 from __future__ import annotations
 
 import asyncio
+import time
 from contextlib import asynccontextmanager
 from datetime import date, datetime, timezone
 
@@ -20,7 +21,7 @@ from app.utils.notifier import notify_daily_summary, notify_error, send_alert
 from app.data.fetcher import DataFetcher
 from app.data.indicators import compute_all_indicators
 from app.data.validator import validate_candles
-from app.execution.signal_bus import SignalBus
+from app.execution.signal_bus import SignalBus, TradeSignal, SignalPriority
 from app.execution.trader import Trader
 from app.execution.order_tracker import OrderTracker
 from app.risk.risk_manager import RiskManager
@@ -37,6 +38,16 @@ trader: Trader | None = None
 signal_bus: SignalBus | None = None
 scheduler: AsyncIOScheduler | None = None
 _start_time: datetime | None = None
+_balance_cache = {"value": 0.0, "time": 0.0}
+
+def _handle_cancelled_order(order_id: str) -> None:
+    """Release notional for a canceled order tracked by order_tracker."""
+    if order_tracker and risk_manager:
+        info = order_tracker._tracked_orders.get(order_id)
+        if info:
+            if info["side"] == "buy":
+                risk_manager.decrement_open_notional(info.get("price", 0.0) * info.get("quantity", 0.0))
+            order_tracker._tracked_orders.pop(order_id, None)
 
 
 # ======================================================================
@@ -58,8 +69,8 @@ async def lifespan(app: FastAPI):
 
     # Execution layer
     signal_bus = SignalBus(cooldown_seconds=settings.COOLDOWN_SECONDS)
-    trader = Trader(fetcher.exchange)
-    order_tracker = OrderTracker(fetcher.exchange, poll_interval=30.0)
+    trader = Trader(fetcher.exchange, on_cancel_cb=_handle_cancelled_order)
+    order_tracker = OrderTracker(fetcher.exchange, poll_interval=30.0, on_cancel_cb=_handle_cancelled_order)
     risk_manager = RiskManager()
 
     # Strategy
@@ -122,9 +133,15 @@ async def lifespan(app: FastAPI):
 # ======================================================================
 async def _signal_consumer_loop() -> None:
     """Process signals from the bus → risk check → execute."""
+    global _balance_cache
     while True:
         signal = await signal_bus.pop()
-        balance = await fetcher.get_balance()
+        
+        now = time.time()
+        if now - _balance_cache["time"] > 5.0:
+            _balance_cache["value"] = await fetcher.get_balance()
+            _balance_cache["time"] = now
+        balance = _balance_cache["value"]
 
         allowed, reason = risk_manager.check_trade_allowed(
             signal.symbol, signal.side, signal.quantity, signal.price or 0, balance,
@@ -148,22 +165,46 @@ async def _signal_consumer_loop() -> None:
                 symbol=signal.symbol,
                 side=signal.side,
                 strategy=signal.strategy,
+                grid_level=signal.grid_level,
+                price=signal.price or 0.0,
+                quantity=signal.quantity,
             )
+        else:
+            # Order placement failed (None returned)
+            if signal.side == "buy":
+                risk_manager.decrement_open_notional((signal.price or 0.0) * signal.quantity)
 
 
 async def _on_order_filled(filled_order: dict) -> None:
     """Route fill events to the correct strategy callback."""
-    strategy = filled_order.get("strategy", "grid_bot")
+    global _balance_cache
+    _balance_cache["time"] = 0.0  # Invalidate cache on any fill/cancel
+    
+    status = filled_order.get("status", "filled")
     side = filled_order.get("side", "")
+    
+    # Status canceled/expired are now handled directly via _handle_cancelled_order hook from order_tracker polling
+    if status != "filled":
+        return
+        
+    strategy = filled_order.get("strategy", "grid_bot")
     pnl = filled_order.get("pnl", 0)
 
     if strategy == "grid_bot" and grid_bot:
         if side == "buy":
             await grid_bot.on_buy_filled(filled_order)
+            if filled_order.get("grid_level") is not None:
+                risk_manager.register_position(filled_order["symbol"], filled_order["grid_level"], filled_order["price"])
         elif side == "sell":
-            await grid_bot.on_sell_filled(filled_order)
-            if pnl:
-                risk_manager.record_trade_result(pnl)
+            cycle_pnl = await grid_bot.on_sell_filled(filled_order)
+            if cycle_pnl:
+                risk_manager.record_trade_result(cycle_pnl)
+            if filled_order.get("grid_level") is not None:
+                # Decrement open notional based on entry price since position is now closed
+                entry_price = risk_manager.state.open_positions.get((filled_order["symbol"], filled_order["grid_level"]))
+                if entry_price:
+                    risk_manager.decrement_open_notional(entry_price * filled_order.get("quantity", 0.0))
+                risk_manager.close_position(filled_order["symbol"], filled_order["grid_level"])
 
 
 # ======================================================================
@@ -182,10 +223,56 @@ async def _candle_update_job() -> None:
         )
         if exit_dir:
             logger.warning("Price exited grid {} — rebalancing.", exit_dir)
-            await grid_bot.rebalance(price)
+            
+            # Close stranded inventory before rebalance
+            for (sym, level_id), entry_price in list(risk_manager.state.open_positions.items()):
+                if sym == symbol:
+                    # Calculate original quantity
+                    qty = grid_bot.capital_per_grid / entry_price
+                    logger.info("Closing stranded position for {} level {} (entry: {:.4f}) at market.", sym, level_id, entry_price)
+                    signal = TradeSignal(
+                        priority=SignalPriority.STOP_LOSS,
+                        timestamp=time.time(),
+                        symbol=sym,
+                        side="sell",
+                        order_type="market",
+                        price=price,
+                        quantity=round(qty, 6),
+                        strategy="grid_bot",
+                        grid_level=level_id,
+                    )
+                    await signal_bus.push(signal)
+                    
+                    # Synchronously close position and release notional to prevent leaks
+                    risk_manager.decrement_open_notional(entry_price * round(qty, 6))
+                    risk_manager.close_position(sym, level_id)
+
+            await grid_bot.rebalance(price, trader)
 
         # Check stop-loss on open positions
-        risk_manager.check_stop_loss(symbol, price)
+        stop_results = risk_manager.check_stop_loss(symbol, price)
+        for level_id, triggered, pct in stop_results:
+            if triggered and level_id < len(grid_bot.state.levels):
+                level = grid_bot.state.levels[level_id]
+                qty = grid_bot.capital_per_grid / level.price
+                signal = TradeSignal(
+                    priority=SignalPriority.STOP_LOSS,
+                    timestamp=time.time(),
+                    symbol=symbol,
+                    side="sell",
+                    order_type="market",
+                    price=price,
+                    quantity=round(qty, 6),
+                    strategy="grid_bot",
+                    grid_level=level_id,
+                )
+                await signal_bus.push(signal)
+                
+                # Synchronously close position and release notional
+                entry_price = risk_manager.state.open_positions.get((symbol, level_id))
+                if entry_price:
+                    risk_manager.decrement_open_notional(entry_price * round(qty, 6))
+                risk_manager.close_position(symbol, level_id)
 
 
 async def _stale_check_job() -> None:
@@ -277,6 +364,9 @@ async def emergency_stop():
         signal_bus.stop()
     if order_tracker:
         order_tracker.stop()
+    if trader and grid_bot and grid_bot.state.symbol:
+        cancelled = await trader.cancel_all_orders(grid_bot.state.symbol)
+        logger.critical("Emergency stop cancelled {} open orders.", cancelled)
     if grid_bot:
         grid_bot.state.active = False
     return {"status": "stopped", "message": "All trading halted."}

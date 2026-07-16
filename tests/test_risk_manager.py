@@ -68,6 +68,39 @@ class TestPreTradeChecks:
         assert allowed is False
         assert "Circuit breaker" in reason
 
+    def test_portfolio_exposure_cap(self):
+        """Trade exceeding MAX_PORTFOLIO_EXPOSURE_PCT should be rejected."""
+        with patch("app.risk.risk_manager.settings") as ms:
+            ms.MAX_TRADE_PCT = 0.20
+            ms.MAX_PORTFOLIO_EXPOSURE_PCT = 0.85
+            self.rm.state.open_notional = 80.0  # 80% of 100 balance
+
+            # A $10 trade brings it to 90%, exceeding 85% limit
+            allowed, reason = self.rm.check_trade_allowed(
+                "BNB/USDT", "buy", 0.0166, 600.0, 100.0,
+            )
+        assert allowed is False
+        assert "Portfolio exposure" in reason
+
+    def test_portfolio_exposure_cap_blocks_after_fills(self):
+        """Total exposure includes open notional which shouldn't clear on buy fill."""
+        with patch("app.risk.risk_manager.settings") as ms:
+            ms.MAX_TRADE_PCT = 1.00
+            ms.MAX_PORTFOLIO_EXPOSURE_PCT = 0.85
+            
+            # Step 1: initial trade allowed
+            allowed, _ = self.rm.check_trade_allowed("BNB/USDT", "buy", 0.08, 1000.0, 100.0) # $80 cost
+            assert allowed is True
+            assert self.rm.state.open_notional == 80.0
+            
+            # Step 2: order fills. We do NOT decrement open_notional on buy fill.
+            # (In main.py it only decrements on canceled/expired, or sell filled)
+            
+            # Step 3: next trade blocked because open_notional is 80, limit is 85
+            allowed, reason = self.rm.check_trade_allowed("BNB/USDT", "buy", 0.01, 1000.0, 100.0) # $10 cost
+            assert allowed is False
+            assert "Portfolio exposure" in reason
+
 
 class TestStopLoss:
     """Test stop-loss monitoring."""
@@ -83,26 +116,35 @@ class TestStopLoss:
             self.rm = RiskManager(initial_balance=100.0)
 
     def test_stop_loss_triggers(self):
-        """Stop-loss should trigger at 2% adverse move."""
-        self.rm.register_position("BNB/USDT", 600.0)
+        """Stop-loss should trigger at 2% adverse move for specific level."""
+        self.rm.register_position("BNB/USDT", 1, 600.0)
+        self.rm.register_position("BNB/USDT", 2, 550.0)
         with patch("app.risk.risk_manager.settings") as ms:
             ms.STOP_LOSS_PCT = 0.02
-            triggered, loss_pct = self.rm.check_stop_loss("BNB/USDT", 586.0)
-        assert triggered is True
-        assert loss_pct > 0.02
+            # 586 is < 600 * 0.98, so level 1 triggers. But 586 > 550, so level 2 does not.
+            results = self.rm.check_stop_loss("BNB/USDT", 586.0)
+            
+        assert len(results) == 2
+        for level_id, triggered, loss_pct in results:
+            if level_id == 1:
+                assert triggered is True
+                assert loss_pct > 0.02
+            else:
+                assert triggered is False
 
     def test_stop_loss_not_triggered(self):
         """Price within tolerance should not trigger stop-loss."""
-        self.rm.register_position("BNB/USDT", 600.0)
+        self.rm.register_position("BNB/USDT", 1, 600.0)
         with patch("app.risk.risk_manager.settings") as ms:
             ms.STOP_LOSS_PCT = 0.02
-            triggered, _ = self.rm.check_stop_loss("BNB/USDT", 595.0)
-        assert triggered is False
+            results = self.rm.check_stop_loss("BNB/USDT", 595.0)
+        assert len(results) == 1
+        assert results[0][1] is False
 
     def test_no_position_no_trigger(self):
         """No stop-loss if no position exists."""
-        triggered, _ = self.rm.check_stop_loss("BNB/USDT", 500.0)
-        assert triggered is False
+        results = self.rm.check_stop_loss("BNB/USDT", 500.0)
+        assert len(results) == 0
 
 
 class TestTakeProfit:
@@ -120,12 +162,13 @@ class TestTakeProfit:
 
     def test_take_profit_triggers(self):
         """Take-profit should trigger at 3%+ gain."""
-        self.rm.register_position("BNB/USDT", 600.0)
+        self.rm.register_position("BNB/USDT", 1, 600.0)
         with patch("app.risk.risk_manager.settings") as ms:
             ms.TAKE_PROFIT_PCT = 0.03
-            triggered, gain_pct = self.rm.check_take_profit("BNB/USDT", 620.0)
-        assert triggered is True
-        assert gain_pct > 0.03
+            results = self.rm.check_take_profit("BNB/USDT", 620.0)
+        assert len(results) == 1
+        assert results[0][1] is True
+        assert results[0][2] > 0.03
 
 
 class TestCircuitBreakers:

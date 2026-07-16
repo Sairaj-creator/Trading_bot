@@ -162,3 +162,16 @@ class TestCancelOrder:
     async def test_cancel_all_empty(self, trader_instance, mock_exchange):
         count = await trader_instance.cancel_all_orders("BNB/USDT")
         assert count == 0
+
+    @pytest.mark.asyncio
+    async def test_cancel_order_not_found_returns_true(self, trader_instance, mock_exchange):
+        mock_exchange.cancel_order = AsyncMock(side_effect=ccxt.OrderNotFound("Already done"))
+        result = await trader_instance.cancel_order("order_001", "BNB/USDT")
+        assert result is True
+
+    @pytest.mark.asyncio
+    async def test_cancel_all_counts_not_found_as_success(self, trader_instance, mock_exchange):
+        mock_exchange.fetch_open_orders = AsyncMock(return_value=[{"id": "1"}, {"id": "2"}])
+        mock_exchange.cancel_order = AsyncMock(side_effect=[None, ccxt.OrderNotFound("Already done")])
+        count = await trader_instance.cancel_all_orders("BNB/USDT")
+        assert count == 2
