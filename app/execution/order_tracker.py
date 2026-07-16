@@ -15,6 +15,7 @@ from loguru import logger
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.utils.notifier import notify_trade
+# pyrefly: ignore [missing-import]
 from database.models import (
     OrderType,
     StrategyName,
