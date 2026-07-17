@@ -4,10 +4,11 @@ from unittest.mock import AsyncMock, patch, MagicMock
 # Mock out the missing database module
 sys.modules['database'] = MagicMock()
 sys.modules['database.models'] = MagicMock()
+sys.modules['database.session'] = MagicMock()
 
-import pytest
-from app.main import _signal_consumer_loop, _handle_cancelled_order
-from app.execution.signal_bus import TradeSignal, SignalPriority
+import pytest  # noqa: E402
+from app.main import _signal_consumer_loop, _handle_cancelled_order  # noqa: E402
+from app.execution.signal_bus import TradeSignal, SignalPriority  # noqa: E402
 
 @pytest.mark.asyncio
 async def test_failed_placement_rollback():
@@ -95,6 +96,8 @@ async def test_stranded_inventory_liquidated_on_rebalance():
         # Simulate 1 open position
         mock_rm.state.open_positions = {("BNB/USDT", 2): {"entry_price": 100.0, "quantity": 1.0}}
         mock_rm.check_stop_loss.return_value = []
+        mock_rm.check_take_profit.return_value = []
+        mock_rm.evaluate_circuit_breakers.return_value = (False, "", 0)
         
         from app.main import _candle_update_job
         import app.config as settings
@@ -136,6 +139,8 @@ async def test_stranded_inventory_liquidation_failure_retains_position():
         mock_rm.check_grid_range_exit.return_value = "above"
         mock_rm.state.open_positions = {("BNB/USDT", 2): {"entry_price": 100.0, "quantity": 1.0}}
         mock_rm.check_stop_loss.return_value = []
+        mock_rm.check_take_profit.return_value = []
+        mock_rm.evaluate_circuit_breakers.return_value = (False, "", 0)
         
         # Simulate create_order failure (returns None)
         mock_trader.create_order = AsyncMock(return_value=None)
@@ -156,3 +161,26 @@ async def test_stranded_inventory_liquidation_failure_retains_position():
         # Rebalance should be aborted
         mock_grid.rebalance.assert_not_called()
 
+@pytest.mark.asyncio
+async def test_stop_loss_argument_order():
+    """Regression test to ensure check_stop_loss is called with (symbol, price)."""
+    with patch("app.main.risk_manager") as mock_rm, \
+         patch("app.main.grid_bot") as mock_grid, \
+         patch("app.main.trader"), \
+         patch("app.main.fetcher") as mock_fetcher:
+        
+        mock_fetcher.get_current_price = AsyncMock(return_value=120.0)
+        mock_fetcher.fetch_latest_candle = AsyncMock()
+        mock_grid.state.active = True
+        
+        mock_rm.check_grid_range_exit.return_value = None
+        mock_rm.check_stop_loss.return_value = []
+        mock_rm.check_take_profit.return_value = []
+        mock_rm.evaluate_circuit_breakers.return_value = (False, "", 0)
+        
+        from app.main import _candle_update_job
+        from app.config import settings
+        
+        await _candle_update_job()
+        
+        mock_rm.check_stop_loss.assert_called_once_with(settings.TRADING_PAIR, 120.0)

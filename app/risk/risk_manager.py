@@ -6,14 +6,12 @@ Pair-trading checks are gated behind a config flag (no circular dependency).
 
 from __future__ import annotations
 
-import asyncio
 from datetime import datetime, timezone
 from dataclasses import dataclass, field
 
 from loguru import logger
 
 from app.config import settings
-from app.utils.notifier import notify_circuit_breaker, notify_stop_loss
 
 
 @dataclass
@@ -121,39 +119,29 @@ class RiskManager:
         else:
             self.state.consecutive_losses = 0
 
-        # Check circuit breakers after update
-        asyncio.ensure_future(self._check_circuit_breakers())
-
-    async def _check_circuit_breakers(self) -> None:
-        """Evaluate all circuit breaker conditions."""
+    def evaluate_circuit_breakers(self) -> tuple[bool, str, int]:
+        """
+        Evaluate all circuit breaker conditions synchronously.
+        Returns (triggered, reason, duration_hours).
+        """
         # Daily loss limit
         daily_loss_pct = abs(self.state.daily_pnl) / self.initial_balance
         if self.state.daily_pnl < 0 and daily_loss_pct >= settings.DAILY_LOSS_LIMIT_PCT:
-            await self._trigger_circuit_breaker(
-                f"Daily loss limit hit: {daily_loss_pct:.2%} "
-                f"(limit: {settings.DAILY_LOSS_LIMIT_PCT:.0%})",
-                duration_hours=24,
-            )
-            return
+            return True, f"Daily loss limit hit: {daily_loss_pct:.2%} (limit: {settings.DAILY_LOSS_LIMIT_PCT:.0%})", 24
 
         # Consecutive losses
         if self.state.consecutive_losses >= settings.CONSECUTIVE_LOSS_LIMIT:
-            await self._trigger_circuit_breaker(
-                f"{self.state.consecutive_losses} consecutive losses",
-                duration_hours=2,
-            )
-            return
+            return True, f"{self.state.consecutive_losses} consecutive losses", 2
 
-    async def _trigger_circuit_breaker(
-        self, reason: str, duration_hours: int = 24,
-    ) -> None:
-        """Activate the circuit breaker and send alert."""
+        return False, "", 0
+
+    def trigger_circuit_breaker(self, reason: str, duration_hours: int = 24) -> None:
+        """Activate the circuit breaker."""
         self.state.circuit_broken = True
         now = datetime.now(timezone.utc)
         from datetime import timedelta
         self.state.circuit_break_until = now + timedelta(hours=duration_hours)
         logger.critical("CIRCUIT BREAKER: {} — halting for {}h", reason, duration_hours)
-        await notify_circuit_breaker(reason)
 
     # ------------------------------------------------------------------
     # Stop-loss / Take-profit monitoring
@@ -176,7 +164,6 @@ class RiskManager:
                         "STOP-LOSS triggered for {} level {} at {:.2%} (limit {:.2%})",
                         symbol, level_id, loss_pct, settings.STOP_LOSS_PCT,
                     )
-                    asyncio.ensure_future(notify_stop_loss(f"{symbol} level {level_id}", loss_pct))
                     results.append((level_id, True, loss_pct))
                 else:
                     results.append((level_id, False, loss_pct))

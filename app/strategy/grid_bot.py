@@ -145,14 +145,16 @@ class GridBot:
         """
         fill_price = filled_order["price"]
 
-        # Find the matching grid level
+        # Find the closest matching grid level
         target_level = None
+        min_diff = float('inf')
         for level in self.state.levels:
-            if abs(level.price - fill_price) / fill_price < 0.005:  # 0.5% tolerance
+            diff = abs(level.price - fill_price)
+            if diff < min_diff:
+                min_diff = diff
                 target_level = level
-                break
 
-        if target_level is None:
+        if target_level is None or (min_diff / fill_price) > 0.01:
             logger.warning("Filled buy at {:.4f} doesn't match any grid level.", fill_price)
             return
 
@@ -196,17 +198,20 @@ class GridBot:
         fill_price = filled_order["price"]
         quantity = filled_order["quantity"]
 
-        # Find the grid level
+        # Find the closest grid level
         matched_level = None
+        min_diff = float('inf')
         for level in self.state.levels:
-            if abs(level.price - fill_price) / fill_price < 0.005:
-                level.has_sell_order = False
+            diff = abs(level.price - fill_price)
+            if diff < min_diff:
+                min_diff = diff
                 matched_level = level
-                break
         
-        if matched_level is None:
+        if matched_level is None or (min_diff / fill_price) > 0.01:
             logger.warning("Filled sell at {:.4f} doesn't match any grid level.", fill_price)
             return 0.0
+            
+        matched_level.has_sell_order = False
 
         # Calculate cycle profit (approximate — one grid interval minus fees)
         grid_interval = 0.0

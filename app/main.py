@@ -17,11 +17,17 @@ from loguru import logger
 
 from app.config import settings
 from app.utils.logger import setup_logger
-from app.utils.notifier import notify_daily_summary, notify_error, send_alert
+from app.utils.notifier import notify_daily_summary, notify_error, send_alert, notify_circuit_breaker, notify_stop_loss
+from database.session import async_session_factory
+import hmac
+from fastapi import Header, HTTPException, Depends
+from fastapi.middleware.cors import CORSMiddleware
+from sqlalchemy import select
+from database.models import Trade
 from app.data.fetcher import DataFetcher
 from app.data.indicators import compute_all_indicators
 from app.data.validator import validate_candles
-from app.execution.signal_bus import SignalBus, TradeSignal, SignalPriority
+from app.execution.signal_bus import SignalBus
 from app.execution.trader import Trader
 from app.execution.order_tracker import OrderTracker
 from app.risk.risk_manager import RiskManager
@@ -48,6 +54,13 @@ def _handle_cancelled_order(order_id: str) -> None:
             if info["side"] == "buy":
                 risk_manager.decrement_open_notional(info.get("price", 0.0) * info.get("quantity", 0.0))
             order_tracker._tracked_orders.pop(order_id, None)
+
+async def _check_and_trigger_circuit_breakers():
+    if risk_manager:
+        triggered, reason, hours = risk_manager.evaluate_circuit_breakers()
+        if triggered:
+            risk_manager.trigger_circuit_breaker(reason, hours)
+            await notify_circuit_breaker(reason)
 
 
 # ======================================================================
@@ -188,7 +201,6 @@ async def _on_order_filled(filled_order: dict) -> None:
         return
         
     strategy = filled_order.get("strategy", "grid_bot")
-    pnl = filled_order.get("pnl", 0)
 
     if strategy == "grid_bot" and grid_bot:
         if side == "buy":
@@ -204,12 +216,23 @@ async def _on_order_filled(filled_order: dict) -> None:
             cycle_pnl = await grid_bot.on_sell_filled(filled_order)
             if cycle_pnl:
                 risk_manager.record_trade_result(cycle_pnl)
+                await _check_and_trigger_circuit_breakers()
+                filled_order["pnl"] = cycle_pnl
             if filled_order.get("grid_level") is not None:
                 # Decrement open notional based on entry price since position is now closed
                 pos_data = risk_manager.state.open_positions.get((filled_order["symbol"], filled_order["grid_level"]))
                 if pos_data:
                     risk_manager.decrement_open_notional(pos_data["entry_price"] * pos_data["quantity"])
                 risk_manager.close_position(filled_order["symbol"], filled_order["grid_level"])
+
+    # Persist to database
+    try:
+        async with async_session_factory() as session:
+            await order_tracker.record_trade(session, filled_order)
+            await session.commit()
+    except Exception as e:
+        logger.error("Database persistence failed for order {}: {}", filled_order.get("order_id"), e)
+
 
 
 # ======================================================================
@@ -263,10 +286,27 @@ async def _candle_update_job() -> None:
                         
                         pnl = (fill_price - entry_price) * filled_qty - fee
                         risk_manager.record_trade_result(pnl)
+                        await _check_and_trigger_circuit_breakers()
                         logger.info("Stranded position {} level {} liquidated. PnL: ${:.4f}", sym, level_id, pnl)
                         
-                        # Note: For DB persistence, the Trade model should ideally be saved here.
-                        # Since DB is stubbed, we leave this as a deliberate no-op for now.
+                        filled_order_db = {
+                            "order_id": order.get("id", ""),
+                            "symbol": sym,
+                            "side": "sell",
+                            "strategy": "grid_bot",
+                            "grid_level": level_id,
+                            "price": fill_price,
+                            "quantity": filled_qty,
+                            "fee": fee,
+                            "pnl": pnl,
+                            "status": "filled"
+                        }
+                        try:
+                            async with async_session_factory() as session:
+                                await order_tracker.record_trade(session, filled_order_db)
+                                await session.commit()
+                        except Exception as e:
+                            logger.error("DB fail on rebalance: {}", e)
                         
                         # Synchronously close position and release notional
                         risk_manager.decrement_open_notional(entry_price * round(qty, 6))
@@ -282,7 +322,8 @@ async def _candle_update_job() -> None:
             await grid_bot.rebalance(price, trader)
 
         # Stop-loss check
-        sl_positions = risk_manager.check_stop_loss(price, symbol)
+        sl_results = risk_manager.check_stop_loss(symbol, price)
+        sl_positions = [(symbol, level_id) for level_id, triggered, _pct in sl_results if triggered]
         if sl_positions:
             sl_tasks = []
             sl_meta = []
@@ -315,11 +356,103 @@ async def _candle_update_job() -> None:
                         
                         pnl = (fill_price - entry_price) * filled_qty - fee
                         risk_manager.record_trade_result(pnl)
+                        await _check_and_trigger_circuit_breakers()
+                        await notify_stop_loss(f"{sym} level {level_id}", (entry_price - fill_price) / entry_price)
+                        
+                        filled_order_db = {
+                            "order_id": order.get("id", ""),
+                            "symbol": sym,
+                            "side": "sell",
+                            "strategy": "grid_bot",
+                            "grid_level": level_id,
+                            "price": fill_price,
+                            "quantity": filled_qty,
+                            "fee": fee,
+                            "pnl": pnl,
+                            "status": "filled"
+                        }
+                        try:
+                            async with async_session_factory() as session:
+                                await order_tracker.record_trade(session, filled_order_db)
+                                await session.commit()
+                        except Exception as e:
+                            logger.error("DB fail on SL: {}", e)
                         
                         risk_manager.decrement_open_notional(entry_price * round(qty, 6))
                         risk_manager.close_position(sym, level_id)
                     else:
                         logger.error("Failed to execute stop-loss for {} level {}", symbol, level_id)
+
+        # Take-profit check
+        tp_results = risk_manager.check_take_profit(symbol, price)
+        tp_positions = [(symbol, level_id) for level_id, triggered, _pct in tp_results if triggered]
+        if tp_positions:
+            tp_tasks = []
+            tp_meta = []
+            
+            for (sym, level_id) in tp_positions:
+                pos_data = risk_manager.state.open_positions.get((sym, level_id))
+                if pos_data:
+                    entry_price = pos_data["entry_price"]
+                    qty = pos_data["quantity"]
+                    
+                    # CANCEL existing limit sell for this grid level to prevent double-execution
+                    if order_tracker:
+                        for oid, info in list(order_tracker._tracked_orders.items()):
+                            if info["symbol"] == sym and info["side"] == "sell" and info.get("grid_level") == level_id:
+                                try:
+                                    await trader.cancel_order(oid, sym)
+                                except Exception as e:
+                                    logger.error("Failed to cancel TP conflicting limit {}: {}", oid, e)
+                                break
+                    
+                    logger.info("Take-profit triggered for {} level {} (entry: {:.4f})", sym, level_id, entry_price)
+                    
+                    tp_meta.append((sym, level_id, entry_price, qty))
+                    tp_tasks.append(trader.create_order(
+                        symbol=sym,
+                        side="sell",
+                        order_type="market",
+                        quantity=round(qty, 6),
+                        price=price
+                    ))
+            
+            if tp_tasks:
+                results = await asyncio.gather(*tp_tasks)
+                for i, order in enumerate(results):
+                    sym, level_id, entry_price, qty = tp_meta[i]
+                    if order and order.get("id"):
+                        fill_price = float(order.get("average") or order.get("price") or price)
+                        filled_qty = float(order.get("filled") or qty)
+                        fee = float(order.get("fee", {}).get("cost", 0.0) if order.get("fee") else 0.0)
+                        
+                        pnl = (fill_price - entry_price) * filled_qty - fee
+                        risk_manager.record_trade_result(pnl)
+                        await _check_and_trigger_circuit_breakers()
+                        
+                        filled_order_db = {
+                            "order_id": order.get("id", ""),
+                            "symbol": sym,
+                            "side": "sell",
+                            "strategy": "grid_bot",
+                            "grid_level": level_id,
+                            "price": fill_price,
+                            "quantity": filled_qty,
+                            "fee": fee,
+                            "pnl": pnl,
+                            "status": "filled"
+                        }
+                        try:
+                            async with async_session_factory() as session:
+                                await order_tracker.record_trade(session, filled_order_db)
+                                await session.commit()
+                        except Exception as e:
+                            logger.error("DB fail on TP: {}", e)
+                        
+                        risk_manager.decrement_open_notional(entry_price * round(qty, 6))
+                        risk_manager.close_position(sym, level_id)
+                    else:
+                        logger.error("Failed to execute take-profit for {} level {}", sym, level_id)
 
 
 async def _stale_check_job() -> None:
@@ -358,6 +491,21 @@ app = FastAPI(
     description="Automated crypto trading system — Binance Spot",
     lifespan=lifespan,
 )
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+def verify_dashboard_key(x_api_key: str = Header(..., alias="X-API-Key")):
+    if not getattr(settings, "DASHBOARD_API_KEY", None):
+        raise HTTPException(status_code=500, detail="DASHBOARD_API_KEY not configured on server")
+    if not hmac.compare_digest(x_api_key, settings.DASHBOARD_API_KEY):
+        raise HTTPException(status_code=401, detail="Invalid API Key")
+    return True
 
 
 @app.get("/health")
@@ -403,8 +551,31 @@ async def daily():
     }
 
 
+@app.get("/trades")
+async def get_trades(limit: int = 50, offset: int = 0):
+    """Return paginated trade history."""
+    try:
+        async with async_session_factory() as session:
+            stmt = select(Trade).order_by(Trade.timestamp.desc()).offset(offset).limit(limit)
+            result = await session.execute(stmt)
+            trades = result.scalars().all()
+            return {"trades": [{"id": t.id, "order_id": t.order_id, "symbol": t.symbol, "side": t.side, "strategy": t.strategy, "grid_level": t.grid_level, "price": t.price, "quantity": t.quantity, "fee": t.fee, "pnl": t.pnl, "status": t.status, "timestamp": t.timestamp.isoformat()} for t in trades]}
+    except Exception as e:
+        logger.error("Failed to fetch trades: {}", e)
+        return {"trades": []}
+
+
+@app.get("/grid")
+async def get_grid():
+    """Detailed grid status for visualization."""
+    return {
+        "status": grid_bot.get_status() if grid_bot else {},
+        "open_positions": risk_manager.state.open_positions if risk_manager else {},
+    }
+
+
 @app.post("/stop")
-async def emergency_stop():
+async def emergency_stop(authorized: bool = Depends(verify_dashboard_key)):
     """Emergency halt — stop all trading."""
     logger.critical("EMERGENCY STOP triggered via API.")
     if signal_bus:

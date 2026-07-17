@@ -43,6 +43,7 @@ class Settings(BaseSettings):
     ENVIRONMENT: str = "development"  # development | testnet | production
     LOG_LEVEL: str = "INFO"
     FASTAPI_PORT: int = 8000
+    DASHBOARD_API_KEY: str = ""
 
     model_config = {"env_file": ".env", "env_file_encoding": "utf-8"}
 
