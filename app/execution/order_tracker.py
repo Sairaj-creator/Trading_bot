@@ -78,7 +78,7 @@ class OrderTracker:
         filled = []
         to_remove = []
 
-        for order_id, info in self._tracked_orders.items():
+        for order_id, info in list(self._tracked_orders.items()):
             try:
                 order = await self.exchange.fetch_order(order_id, info["symbol"])
             except ccxt.BaseError as exc:

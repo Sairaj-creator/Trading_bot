@@ -82,6 +82,20 @@ def compute_atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
     return result.rename("atr")
 
 
+def compute_adx(df: pd.DataFrame, period: int = 14) -> pd.Series:
+    """Compute Average Directional Index — used for trend pause filtering."""
+    if len(df) < period + 1:
+        logger.warning("Not enough data for ADX-{} ({} rows).", period, len(df))
+        return pd.Series(dtype=float, index=df.index)
+    
+    # ta.adx returns a DataFrame with columns: ADX_14, DMP_14, DMN_14
+    result = ta.adx(df["high"], df["low"], df["close"], length=period)
+    if result is None or result.empty:
+        return pd.Series(dtype=float, index=df.index)
+    
+    return result[f"ADX_{period}"].rename("adx")
+
+
 def compute_correlation(
     series_a: pd.Series,
     series_b: pd.Series,
@@ -102,7 +116,7 @@ def compute_correlation(
 
 def compute_all_indicators(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Convenience: compute RSI-14, EMA-20/50/200, Bollinger, ATR-14
+    Convenience: compute RSI-14, EMA-20/50/200, Bollinger, ATR-14, ADX-14
     and merge into a single DataFrame.
     """
     result = df.copy()
@@ -112,4 +126,5 @@ def compute_all_indicators(df: pd.DataFrame) -> pd.DataFrame:
     bb = compute_bollinger(df, 20, 2.0)
     result = pd.concat([result, bb], axis=1)
     result["atr"] = compute_atr(df, 14)
+    result["adx"] = compute_adx(df, 14)
     return result

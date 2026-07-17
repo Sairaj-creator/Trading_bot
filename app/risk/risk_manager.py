@@ -80,6 +80,17 @@ class RiskManager:
                 f"Trade cost ${trade_cost:.2f} exceeds max "
                 f"${max_allowed:.2f} ({settings.MAX_TRADE_PCT:.0%} of balance)",
             )
+
+        # Sell sanity check: Ensure sell quantity doesn't significantly exceed total tracked inventory.
+        # Note: This check only protects standard grid buy->sell flows via signal_bus. 
+        # SL/TP/rebalance liquidations in main.py call trader directly and bypass this.
+        if side == "sell":
+            tracked_inventory = sum(
+                pos["quantity"] for (sym, _), pos in self.state.open_positions.items() if sym == symbol
+            )
+            # Add a 1% tolerance for fee adjustments and float rounding
+            if quantity > (tracked_inventory * 1.01):
+                return False, f"Sell quantity {quantity} exceeds tracked inventory {tracked_inventory} (with 1% tolerance)"
             
         # Max portfolio exposure (default 85%)
         if side == "buy" and hasattr(settings, "MAX_PORTFOLIO_EXPOSURE_PCT"):

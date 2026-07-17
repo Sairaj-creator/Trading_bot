@@ -21,6 +21,8 @@ source venv/bin/activate        # Linux/Mac
 
 # 2. Install dependencies
 pip install -r requirements.txt
+pre-commit install
+pre-commit run --all-files
 
 # 3. Configure
 cp .env.example .env

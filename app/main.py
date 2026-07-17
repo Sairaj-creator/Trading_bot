@@ -22,8 +22,8 @@ from database.session import async_session_factory
 import hmac
 from fastapi import Header, HTTPException, Depends
 from fastapi.middleware.cors import CORSMiddleware
-from sqlalchemy import select
-from database.models import Trade
+from sqlalchemy import select, func
+from database.models import Trade, TradeStatus
 from app.data.fetcher import DataFetcher
 from app.data.indicators import compute_all_indicators
 from app.data.validator import validate_candles
@@ -99,6 +99,10 @@ async def lifespan(app: FastAPI):
         clean = validate_candles(candles)
         indicators = compute_all_indicators(clean)
         logger.info("Initial indicators computed ({} rows).", len(indicators))
+        
+        if not indicators.empty:
+            latest = indicators.iloc[-1]
+            grid_bot.update_indicators(latest.get("atr"), latest.get("adx"))
 
         # Initialize grid around current price
         price = await fetcher.get_current_price(symbol)
@@ -241,8 +245,15 @@ async def _on_order_filled(filled_order: dict) -> None:
 async def _candle_update_job() -> None:
     """Fetch latest candle and check grid/risk state."""
     symbol = settings.TRADING_PAIR
-    await fetcher.fetch_latest_candle(symbol)
+    candles = await fetcher.fetch_latest_candle(symbol)
     price = await fetcher.get_current_price(symbol)
+    
+    if not candles.empty and grid_bot:
+        clean = validate_candles(candles)
+        inds = compute_all_indicators(clean)
+        if not inds.empty:
+            latest = inds.iloc[-1]
+            grid_bot.update_indicators(latest.get("atr"), latest.get("adx"))
 
     if price and grid_bot and grid_bot.state.active:
         # Check if price exited grid range
@@ -466,20 +477,43 @@ async def _stale_check_job() -> None:
 
 async def _daily_summary_job() -> None:
     """Send daily P&L summary via Telegram at 00:30 UTC."""
-    today = date.today().isoformat()
-    balance = await fetcher.get_balance()
-    drawdown = risk_manager.update_drawdown(balance)
+    from datetime import timedelta
+    now_utc = datetime.now(timezone.utc)
+    start_of_window = now_utc - timedelta(hours=24)
+    today = now_utc.date().isoformat()
+    
+    total_fees = 0.0
+    try:
+        async with async_session_factory() as session:
+            stmt = select(func.sum(Trade.fee_usdt)).where(
+                Trade.timestamp >= start_of_window,
+                Trade.timestamp < now_utc,
+                Trade.status == TradeStatus.filled
+            )
+            result = await session.execute(stmt)
+            total_fees = float(result.scalar() or 0.0)
+    except Exception as e:
+        logger.error("Failed to aggregate daily fees: {}", e)
+
+    balance = 0.0
+    if fetcher:
+        balance = await fetcher.get_balance()
+        
+    drawdown = 0.0
+    if risk_manager:
+        drawdown = risk_manager.update_drawdown(balance)
 
     await notify_daily_summary(
         date=today,
-        trades=risk_manager.state.daily_trades,
-        pnl=risk_manager.state.daily_pnl,
-        fees=0.0,  # TODO: aggregate from DB
+        trades=risk_manager.state.daily_trades if risk_manager else 0,
+        pnl=risk_manager.state.daily_pnl if risk_manager else 0.0,
+        fees=total_fees,
         drawdown=drawdown,
     )
 
     # Reset daily counters
-    risk_manager.reset_daily(balance)
+    if risk_manager:
+        risk_manager.reset_daily(balance)
 
 
 # ======================================================================
@@ -494,8 +528,8 @@ app = FastAPI(
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
+    allow_origins=["http://localhost:5173"],
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -528,10 +562,14 @@ async def positions():
     """Return all open positions and grid status."""
     grid_status = grid_bot.get_status() if grid_bot else {}
     tracked = order_tracker.active_orders if order_tracker else 0
+    open_pos = {}
+    if risk_manager:
+        for k, v in risk_manager.state.open_positions.items():
+            open_pos[str(k)] = v
     return {
         "grid": grid_status,
         "tracked_orders": tracked,
-        "open_positions": risk_manager.state.open_positions if risk_manager else {},
+        "open_positions": open_pos,
     }
 
 

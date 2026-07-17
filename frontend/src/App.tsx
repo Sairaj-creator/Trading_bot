@@ -1,6 +1,8 @@
-import { useState } from 'react'
+import { useState, useMemo } from 'react'
 import { useQuery } from '@tanstack/react-query'
 import { AlertCircle, CheckCircle2, TrendingUp, DollarSign, Activity } from 'lucide-react'
+import { LineChart, Line, YAxis, ResponsiveContainer, Tooltip, XAxis } from 'recharts'
+import './App.css'
 
 // You'd typically load this from import.meta.env
 const API_URL = import.meta.env.VITE_API_URL || 'http://localhost:8000'
@@ -11,29 +13,30 @@ function App() {
   const [stopLoading, setStopLoading] = useState(false)
   const [stopMessage, setStopMessage] = useState('')
 
-  // Queries
+  // Queries - Real-time polling every 5s
   const { data: health } = useQuery({
     queryKey: ['health'],
     queryFn: () => fetch(`${API_URL}/health`).then(res => res.json()),
-    refetchInterval: 60000,
+    refetchInterval: 5000,
   })
 
   const { data: daily } = useQuery({
     queryKey: ['daily'],
     queryFn: () => fetch(`${API_URL}/daily`).then(res => res.json()),
-    refetchInterval: 60000,
+    refetchInterval: 5000,
   })
 
   const { data: gridData } = useQuery({
     queryKey: ['grid'],
     queryFn: () => fetch(`${API_URL}/grid`).then(res => res.json()),
-    refetchInterval: 60000,
+    refetchInterval: 5000,
   })
 
+  // Fetch up to 500 trades to ensure we have a full day's history for the chart
   const { data: tradesData } = useQuery({
     queryKey: ['trades'],
-    queryFn: () => fetch(`${API_URL}/trades?limit=50`).then(res => res.json()),
-    refetchInterval: 60000,
+    queryFn: () => fetch(`${API_URL}/trades?limit=500`).then(res => res.json()),
+    refetchInterval: 5000,
   })
 
   const handleEmergencyStop = async () => {
@@ -61,53 +64,78 @@ function App() {
 
   const isRunning = health?.status === 'running'
   const isCircuitBroken = health?.circuit_breaker
+  const currentPrice = health?.current_price
+
+  // PnL Chart Data processing
+  const pnlData = useMemo(() => {
+    if (!tradesData?.trades) return []
+    const today = new Date().toISOString().split('T')[0]
+    
+    // Filter only today's trades and those with PnL (sells)
+    const closedTrades = tradesData.trades
+      .filter((t: any) => t.pnl !== null && t.timestamp.startsWith(today))
+      .sort((a: any, b: any) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime())
+    
+    let cumulative = 0
+    return closedTrades.map((t: any) => {
+      cumulative += t.pnl
+      return { 
+        time: new Date(t.timestamp).toLocaleTimeString([], {hour: '2-digit', minute:'2-digit'}), 
+        cumulative: Number(cumulative.toFixed(4)), 
+        pnl: t.pnl 
+      }
+    })
+  }, [tradesData])
+
+  // Grid Visualizer Calculation
+  const gridStatus = gridData?.status
+  const activeLevels = gridStatus?.levels || []
+  const gridLow = gridStatus?.grid_low
+  const gridHigh = gridStatus?.grid_high
 
   return (
-    <div className="min-h-screen p-6 max-w-7xl mx-auto space-y-6">
+    <div className="dashboard-container">
       {/* Header section */}
-      <header className="flex justify-between items-center pb-4 border-b border-border">
-        <div>
-          <h1 className="text-3xl font-bold flex items-center gap-3">
-            <Activity className="text-blue-500" />
+      <header className="dashboard-header">
+        <div className="header-title-container">
+          <h1>
+            <Activity className="header-icon" size={28} />
             SmartTrade Dashboard
           </h1>
-          <p className="text-sm text-gray-400 mt-1">
+          <p className="header-subtitle">
             Pair: {health?.pair || 'Loading...'} | Env: {health?.environment || '-'}
+            {currentPrice && ` | Price: $${currentPrice.toFixed(4)}`}
           </p>
         </div>
         
-        <div className="flex items-center gap-4">
+        <div className="header-actions">
           {isCircuitBroken ? (
-            <div className="px-4 py-2 bg-red-900/30 text-red-500 rounded-full border border-red-500/50 flex items-center gap-2">
+            <div className="status-badge status-broken">
               <AlertCircle size={18} />
               Circuit Broken
             </div>
           ) : isRunning ? (
-            <div className="px-4 py-2 bg-green-900/30 text-green-500 rounded-full border border-green-500/50 flex items-center gap-2">
+            <div className="status-badge status-active">
               <CheckCircle2 size={18} />
               Active
             </div>
           ) : (
-            <div className="px-4 py-2 bg-gray-800 text-gray-400 rounded-full border border-gray-600 flex items-center gap-2">
+            <div className="status-badge status-unknown">
               <Activity size={18} />
               Unknown State
             </div>
           )}
 
-          <div className="relative">
+          <div className="relative-container">
             <button 
               onClick={handleEmergencyStop}
               disabled={stopLoading}
-              className={`px-4 py-2 rounded-md font-medium transition-colors ${
-                stopConfirmed 
-                  ? 'bg-red-600 hover:bg-red-700 text-white animate-pulse' 
-                  : 'bg-red-500/10 text-red-500 border border-red-500 hover:bg-red-500/20'
-              }`}
+              className={`btn-stop ${stopConfirmed ? 'confirming' : ''}`}
             >
               {stopLoading ? 'Stopping...' : stopConfirmed ? 'Confirm Stop!' : 'Emergency Stop'}
             </button>
             {stopMessage && (
-              <div className="absolute top-full right-0 mt-2 text-sm text-red-400 whitespace-nowrap">
+              <div className="error-message">
                 {stopMessage}
               </div>
             )}
@@ -116,58 +144,132 @@ function App() {
       </header>
 
       {/* P&L Summary Cards */}
-      <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
-        <div className="bg-card p-5 rounded-xl border border-border">
-          <div className="flex items-center gap-2 text-gray-400 mb-2"><DollarSign size={16}/> Daily P&L</div>
-          <div className={`text-2xl font-bold ${(daily?.pnl || 0) >= 0 ? 'text-green-500' : 'text-red-500'}`}>
+      <div className="stats-grid">
+        <div className="glass-panel">
+          <div className="stat-label"><DollarSign size={16}/> Daily P&L</div>
+          <div className={`stat-value ${(daily?.pnl || 0) >= 0 ? 'text-positive' : 'text-negative'}`}>
             ${daily?.pnl?.toFixed(4) || '0.0000'}
           </div>
         </div>
-        <div className="bg-card p-5 rounded-xl border border-border">
-          <div className="flex items-center gap-2 text-gray-400 mb-2"><TrendingUp size={16}/> Daily Trades</div>
-          <div className="text-2xl font-bold">{daily?.trades || 0}</div>
+        
+        <div className="glass-panel">
+          <div className="stat-label"><TrendingUp size={16}/> Daily Trades</div>
+          <div className="stat-value text-neutral">{daily?.trades || 0}</div>
         </div>
-        <div className="bg-card p-5 rounded-xl border border-border">
-          <div className="flex items-center gap-2 text-gray-400 mb-2">Consecutive Losses</div>
-          <div className={`text-2xl font-bold ${(daily?.consecutive_losses || 0) > 0 ? 'text-orange-500' : ''}`}>
+        
+        <div className="glass-panel">
+          <div className="stat-label">Consecutive Losses</div>
+          <div className={`stat-value ${(daily?.consecutive_losses || 0) > 0 ? 'text-warning' : 'text-neutral'}`}>
             {daily?.consecutive_losses || 0}
           </div>
         </div>
-        <div className="bg-card p-5 rounded-xl border border-border">
-          <div className="flex items-center gap-2 text-gray-400 mb-2">Total Balance</div>
-          <div className="text-2xl font-bold">${daily?.balance?.toFixed(2) || '0.00'}</div>
+        
+        <div className="glass-panel">
+          <div className="stat-label">Total Balance</div>
+          <div className="stat-value text-neutral">${daily?.balance?.toFixed(2) || '0.00'}</div>
         </div>
       </div>
 
-      <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
-        {/* Open Positions */}
-        <div className="bg-card rounded-xl border border-border overflow-hidden flex flex-col">
-          <div className="p-4 border-b border-border bg-gray-800/50">
-            <h2 className="font-semibold text-lg">Open Grid Positions</h2>
+      <div className="charts-grid">
+        {/* Performance Sparkline */}
+        <div className="glass-panel chart-panel">
+          <div className="panel-header">
+            <h2>Today's Cumulative PnL</h2>
           </div>
-          <div className="overflow-y-auto max-h-[500px]">
-            <table className="w-full text-left text-sm">
-              <thead className="bg-gray-900/50 text-gray-400 sticky top-0">
+          <div className="sparkline-container">
+            {pnlData.length > 0 ? (
+              <ResponsiveContainer width="100%" height="100%">
+                <LineChart data={pnlData}>
+                  <XAxis dataKey="time" hide />
+                  <YAxis domain={['auto', 'auto']} hide />
+                  <Tooltip 
+                    contentStyle={{ backgroundColor: 'rgba(17, 24, 39, 0.9)', border: '1px solid rgba(255,255,255,0.1)', borderRadius: '8px' }}
+                    itemStyle={{ color: '#10b981' }}
+                  />
+                  <Line 
+                    type="monotone" 
+                    dataKey="cumulative" 
+                    stroke="#10b981" 
+                    strokeWidth={2} 
+                    dot={false}
+                    isAnimationActive={false}
+                  />
+                </LineChart>
+              </ResponsiveContainer>
+            ) : (
+              <div className="empty-state">No closed trades today</div>
+            )}
+          </div>
+        </div>
+
+        {/* Grid Ladder Visualization */}
+        <div className="glass-panel chart-panel">
+          <div className="panel-header">
+            <h2>Live Grid Ladder</h2>
+          </div>
+          <div className="ladder-container">
+            {gridLow && gridHigh && currentPrice ? (
+              <div className="ladder-bar-wrapper">
+                <div className="ladder-labels">
+                  <span>${gridHigh.toFixed(2)}</span>
+                  <span>${gridLow.toFixed(2)}</span>
+                </div>
+                <div className="ladder-bar">
+                  {/* Price Indicator */}
+                  {currentPrice >= gridLow && currentPrice <= gridHigh && (
+                    <div 
+                      className="ladder-price-marker"
+                      style={{ bottom: `${((currentPrice - gridLow) / (gridHigh - gridLow)) * 100}%` }}
+                    >
+                      <div className="ladder-price-label">${currentPrice.toFixed(2)}</div>
+                    </div>
+                  )}
+                  {/* Grid Levels */}
+                  {activeLevels.map((lvl: any) => (
+                    <div 
+                      key={lvl.index}
+                      className={`ladder-level ${lvl.has_buy ? 'level-buy' : lvl.has_sell ? 'level-sell' : ''}`}
+                      style={{ bottom: `${((lvl.price - gridLow) / (gridHigh - gridLow)) * 100}%` }}
+                    />
+                  ))}
+                </div>
+              </div>
+            ) : (
+              <div className="empty-state">Grid not initialized or loading</div>
+            )}
+          </div>
+        </div>
+      </div>
+
+      <div className="tables-grid">
+        {/* Open Positions */}
+        <div className="glass-panel">
+          <div className="panel-header">
+            <h2>Open Grid Positions</h2>
+          </div>
+          <div className="table-container">
+            <table>
+              <thead>
                 <tr>
-                  <th className="p-4 font-medium">Level</th>
-                  <th className="p-4 font-medium">Entry Price</th>
-                  <th className="p-4 font-medium">Quantity</th>
+                  <th>Level</th>
+                  <th>Entry Price</th>
+                  <th>Quantity</th>
                 </tr>
               </thead>
-              <tbody className="divide-y divide-border">
+              <tbody>
                 {Object.entries(gridData?.open_positions || {}).map(([key, pos]: [string, any]) => {
                   const levelId = key.replace(/[^\d]/g, '') // naive extract
                   return (
-                    <tr key={key} className="hover:bg-gray-800/30 transition-colors">
-                      <td className="p-4 text-gray-300">#{levelId || '?'}</td>
-                      <td className="p-4 font-mono">${pos.entry_price?.toFixed(4)}</td>
-                      <td className="p-4 font-mono">{pos.quantity?.toFixed(6)}</td>
+                    <tr key={key}>
+                      <td>#{levelId || '?'}</td>
+                      <td className="font-mono">${pos.entry_price?.toFixed(4)}</td>
+                      <td className="font-mono">{pos.quantity?.toFixed(6)}</td>
                     </tr>
                   )
                 })}
                 {Object.keys(gridData?.open_positions || {}).length === 0 && (
                   <tr>
-                    <td colSpan={3} className="p-8 text-center text-gray-500">No open positions</td>
+                    <td colSpan={3} className="text-center">No open positions</td>
                   </tr>
                 )}
               </tbody>
@@ -176,46 +278,45 @@ function App() {
         </div>
 
         {/* Trade History */}
-        <div className="bg-card rounded-xl border border-border overflow-hidden flex flex-col">
-          <div className="p-4 border-b border-border bg-gray-800/50">
-            <h2 className="font-semibold text-lg">Recent Trades</h2>
+        <div className="glass-panel">
+          <div className="panel-header">
+            <h2>Recent Trades</h2>
           </div>
-          <div className="overflow-y-auto max-h-[500px]">
-            <table className="w-full text-left text-sm">
-              <thead className="bg-gray-900/50 text-gray-400 sticky top-0">
+          <div className="table-container">
+            <table>
+              <thead>
                 <tr>
-                  <th className="p-4 font-medium">Time</th>
-                  <th className="p-4 font-medium">Type</th>
-                  <th className="p-4 font-medium text-right">PnL</th>
+                  <th>Time</th>
+                  <th>Type</th>
+                  <th className="text-right">PnL</th>
                 </tr>
               </thead>
-              <tbody className="divide-y divide-border">
-                {tradesData?.trades?.map((trade: any) => (
-                  <tr key={trade.id} className="hover:bg-gray-800/30 transition-colors">
-                    <td className="p-4 text-gray-400 whitespace-nowrap">
+              <tbody>
+                {/* Take the first 50 from our 500 limit fetch to display in the table */}
+                {tradesData?.trades?.slice(0, 50).map((trade: any) => (
+                  <tr key={trade.id}>
+                    <td>
                       {new Date(trade.timestamp).toLocaleTimeString()}
                     </td>
-                    <td className="p-4">
-                      <span className={`px-2 py-1 rounded text-xs font-medium ${
-                        trade.side === 'buy' ? 'bg-green-500/10 text-green-500' : 'bg-red-500/10 text-red-500'
-                      }`}>
-                        {trade.side.toUpperCase()}
+                    <td>
+                      <span className={`tag ${trade.side === 'buy' ? 'tag-buy' : 'tag-sell'}`}>
+                        {trade.side}
                       </span>
                     </td>
-                    <td className="p-4 text-right font-mono">
+                    <td className="text-right font-mono">
                       {trade.pnl !== null ? (
-                        <span className={trade.pnl >= 0 ? 'text-green-500' : 'text-red-500'}>
+                        <span className={`pnl-value ${trade.pnl >= 0 ? 'text-positive' : 'text-negative'}`}>
                           ${trade.pnl > 0 ? '+' : ''}{trade.pnl.toFixed(4)}
                         </span>
                       ) : (
-                        <span className="text-gray-500">-</span>
+                        <span className="text-neutral">-</span>
                       )}
                     </td>
                   </tr>
                 ))}
                 {(!tradesData?.trades || tradesData.trades.length === 0) && (
                   <tr>
-                    <td colSpan={3} className="p-8 text-center text-gray-500">No recent trades</td>
+                    <td colSpan={3} className="text-center">No recent trades</td>
                   </tr>
                 )}
               </tbody>

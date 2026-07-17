@@ -50,6 +50,15 @@ class GridBot:
         self.signal_bus = signal_bus
         self.state = GridState()
         self.capital_per_grid = settings.capital_per_grid
+        self.current_atr: float | None = None
+        self.current_adx: float | None = None
+
+    def update_indicators(self, atr: float, adx: float) -> None:
+        """Update indicators for dynamic grid sizing and trend filtering."""
+        if atr is not None:
+            self.current_atr = atr
+        if adx is not None:
+            self.current_adx = adx
 
     # ------------------------------------------------------------------
     # Grid Initialization
@@ -66,7 +75,20 @@ class GridBot:
         Calculate grid levels centered on current price.
         Grid range is ±grid_range_pct from current price.
         """
-        grid_range = grid_range_pct or settings.GRID_RANGE_PCT
+        grid_range = grid_range_pct
+        if grid_range is None:
+            if self.current_atr:
+                # 2x ATR% clamped to MIN and MAX bounds
+                atr_pct = self.current_atr / current_price
+                clamped = max(
+                    getattr(settings, "GRID_MIN_RANGE_PCT", 0.03),
+                    min(atr_pct * 2.0, getattr(settings, "GRID_MAX_RANGE_PCT", 0.15))
+                )
+                logger.info("Using ATR-derived grid range {:.3%} (ATR: {:.4f})", clamped, self.current_atr)
+                grid_range = clamped
+            else:
+                grid_range = settings.GRID_RANGE_PCT
+                
         levels = num_levels or settings.GRID_LEVELS
 
         grid_low = current_price * (1 - grid_range)
@@ -113,6 +135,12 @@ class GridBot:
         """
         if not self.state.active:
             logger.warning("Grid not active — call initialize_grid() first.")
+            return 0
+
+        # ADX trend filter: block buying if trending strongly
+        adx_thresh = getattr(settings, "TREND_ADX_THRESHOLD", 25.0)
+        if self.current_adx and self.current_adx > adx_thresh:
+            logger.warning("ADX {:.1f} > {}. Trend detected. Pausing initial buy orders.", self.current_adx, adx_thresh)
             return 0
 
         signals_pushed = 0
@@ -233,20 +261,27 @@ class GridBot:
         if buy_level_idx < len(self.state.levels):
             buy_level = self.state.levels[buy_level_idx]
             if not buy_level.has_buy_order:
-                qty = self.capital_per_grid / buy_level.price
-                signal = TradeSignal(
-                    priority=SignalPriority.GRID_ORDER,
-                    timestamp=time.time(),
-                    symbol=self.state.symbol,
-                    side="buy",
-                    order_type="limit",
-                    price=buy_level.price,
-                    quantity=round(qty, 6),
-                    strategy="grid_bot",
-                    grid_level=buy_level.index,
-                )
-                await self.signal_bus.push(signal)
-                buy_level.has_buy_order = True
+                adx_thresh = getattr(settings, "TREND_ADX_THRESHOLD", 25.0)
+                if self.current_adx and self.current_adx > adx_thresh:
+                    logger.warning(
+                        "ADX {:.1f} > {}. Trend detected. Pausing buy replenishment at level {}.", 
+                        self.current_adx, adx_thresh, buy_level.index
+                    )
+                else:
+                    qty = self.capital_per_grid / buy_level.price
+                    signal = TradeSignal(
+                        priority=SignalPriority.GRID_ORDER,
+                        timestamp=time.time(),
+                        symbol=self.state.symbol,
+                        side="buy",
+                        order_type="limit",
+                        price=buy_level.price,
+                        quantity=round(qty, 6),
+                        strategy="grid_bot",
+                        grid_level=buy_level.index,
+                    )
+                    await self.signal_bus.push(signal)
+                    buy_level.has_buy_order = True
         
         return cycle_pnl
 

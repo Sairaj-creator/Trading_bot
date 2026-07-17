@@ -30,6 +30,9 @@ class Settings(BaseSettings):
     DAILY_LOSS_LIMIT_PCT: float = 0.05
     GRID_LEVELS: int = 16
     GRID_RANGE_PCT: float = 0.08
+    GRID_MIN_RANGE_PCT: float = 0.03
+    GRID_MAX_RANGE_PCT: float = 0.15
+    TREND_ADX_THRESHOLD: float = 25.0
     STOP_LOSS_PCT: float = 0.02
     TAKE_PROFIT_PCT: float = 0.03
     CONSECUTIVE_LOSS_LIMIT: int = 3
@@ -80,6 +83,10 @@ class Settings(BaseSettings):
             raise ValueError("TAKE_PROFIT_PCT must be between 0 and 1.")
         if not 0 < self.GRID_RANGE_PCT < 1:
             raise ValueError("GRID_RANGE_PCT must be between 0 and 1.")
+        if not 0 < self.GRID_MIN_RANGE_PCT < self.GRID_MAX_RANGE_PCT < 1:
+            raise ValueError("GRID_MIN_RANGE_PCT must be less than GRID_MAX_RANGE_PCT, and both between 0 and 1.")
+        if self.TREND_ADX_THRESHOLD <= 0:
+            raise ValueError("TREND_ADX_THRESHOLD must be positive.")
         if not 0 < self.DAILY_LOSS_LIMIT_PCT < 1:
             raise ValueError("DAILY_LOSS_LIMIT_PCT must be between 0 and 1.")
         if self.GRID_LEVELS < 2:

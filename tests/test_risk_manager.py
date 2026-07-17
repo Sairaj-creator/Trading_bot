@@ -56,17 +56,29 @@ class TestPreTradeChecks:
         assert not allowed
         assert "exceeds max" in msg
 
-    def test_check_trade_allowed_ignores_sell_quantity(self):
-        """Test that MAX_TRADE_PCT does not apply to sells, even if oversized."""
+    def test_check_trade_allowed_sell_within_inventory(self):
+        """Test that a sell within the tracked inventory (with tolerance) is allowed."""
+        self.rm.register_position("BNB/USDT", 1, 600.0, 1.0)
         with patch("app.risk.risk_manager.settings") as ms:
             ms.MAX_TRADE_PCT = 0.20
-            # 5.0 * 100 = $500, which is 50% of balance (exceeds 20% cap)
-            # But because it's a sell, it should be allowed
+            # Sell 1.005, which is within the 1% tolerance of tracked inventory 1.0
             allowed, msg = self.rm.check_trade_allowed(
-                "BNB/USDT", "sell", 5.0, 100.0, 1000.0
+                "BNB/USDT", "sell", 1.005, 100.0, 1000.0
             )
         assert allowed is True
         assert msg == "OK"
+
+    def test_check_trade_allowed_oversized_sell_blocked(self):
+        """Test that an oversized sell exceeding tracked inventory is blocked."""
+        self.rm.register_position("BNB/USDT", 1, 600.0, 1.0)
+        with patch("app.risk.risk_manager.settings") as ms:
+            ms.MAX_TRADE_PCT = 0.20
+            # Sell 5.0, which greatly exceeds tracked inventory 1.0
+            allowed, msg = self.rm.check_trade_allowed(
+                "BNB/USDT", "sell", 5.0, 100.0, 1000.0
+            )
+        assert allowed is False
+        assert "exceeds tracked inventory" in msg
 
     def test_circuit_broken_rejects_trade(self):
         """No trades should pass when circuit breaker is active."""

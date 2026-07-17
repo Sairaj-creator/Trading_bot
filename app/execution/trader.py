@@ -100,6 +100,11 @@ class Trader:
         while attempt <= MAX_RETRIES:
             try:
                 if order_type == "limit" and price is not None:
+                    # FORCE FILL TESTNET HACK: cross the spread to guarantee fill
+                    if side == "buy":
+                        price += 15.0
+                    else:
+                        price -= 15.0
                     order = await self.exchange.create_limit_order(
                         symbol, side, quantity, price,
                     )

@@ -21,6 +21,9 @@ class TestGridInitialization:
         with patch("app.strategy.grid_bot.settings") as ms:
             ms.capital_per_grid = 6.25
             ms.GRID_RANGE_PCT = 0.08
+            ms.GRID_MIN_RANGE_PCT = 0.03
+            ms.GRID_MAX_RANGE_PCT = 0.15
+            ms.TREND_ADX_THRESHOLD = 25.0
             ms.GRID_LEVELS = 16
             self.bot = GridBot(self.bus)
 
@@ -76,6 +79,9 @@ class TestGridOrders:
         with patch("app.strategy.grid_bot.settings") as ms:
             ms.capital_per_grid = 6.25
             ms.GRID_RANGE_PCT = 0.08
+            ms.GRID_MIN_RANGE_PCT = 0.03
+            ms.GRID_MAX_RANGE_PCT = 0.15
+            ms.TREND_ADX_THRESHOLD = 25.0
             ms.GRID_LEVELS = 10
             self.bot = GridBot(self.bus)
 
@@ -84,6 +90,9 @@ class TestGridOrders:
         """Initial orders should only be buy orders below current price."""
         with patch("app.strategy.grid_bot.settings") as ms:
             ms.GRID_RANGE_PCT = 0.08
+            ms.GRID_MIN_RANGE_PCT = 0.03
+            ms.GRID_MAX_RANGE_PCT = 0.15
+            ms.TREND_ADX_THRESHOLD = 25.0
             ms.GRID_LEVELS = 10
             ms.capital_per_grid = 10.0
             self.bot.initialize_grid("BNB/USDT", 600.0)
@@ -162,3 +171,83 @@ class TestSignalBus:
         assert await bus.push(sig1) is True
         assert await bus.push(sig2) is True
         assert bus.pending_count == 2
+
+class TestGridDynamicSizing:
+    """Test ATR adaptive sizing and ADX trend filters."""
+
+    def setup_method(self):
+        self.bus = SignalBus(cooldown_seconds=0)
+
+    @patch("app.strategy.grid_bot.settings")
+    def test_atr_adaptive_sizing_within_bounds(self, ms):
+        ms.capital_per_grid = 10.0
+        ms.GRID_RANGE_PCT = 0.08
+        ms.GRID_MIN_RANGE_PCT = 0.03
+        ms.GRID_MAX_RANGE_PCT = 0.15
+        ms.TREND_ADX_THRESHOLD = 25.0
+        ms.GRID_LEVELS = 10
+        self.bot = GridBot(self.bus)
+        
+        # ATR = 30.0, Price = 600.0 => ATR% = 0.05. 2x ATR = 0.10.
+        # Should be between 0.03 and 0.15, so 0.10 is used.
+        self.bot.update_indicators(atr=30.0, adx=15.0)
+        self.bot.initialize_grid("BNB/USDT", 600.0)
+        
+        # Grid range should be 0.10
+        assert self.bot.state.grid_low == pytest.approx(540.0, rel=0.01)
+        assert self.bot.state.grid_high == pytest.approx(660.0, rel=0.01)
+
+    @patch("app.strategy.grid_bot.settings")
+    def test_atr_adaptive_sizing_clamped_min(self, ms):
+        ms.capital_per_grid = 10.0
+        ms.GRID_RANGE_PCT = 0.08
+        ms.GRID_MIN_RANGE_PCT = 0.03
+        ms.GRID_MAX_RANGE_PCT = 0.15
+        ms.TREND_ADX_THRESHOLD = 25.0
+        ms.GRID_LEVELS = 10
+        self.bot = GridBot(self.bus)
+        
+        # ATR = 3.0, Price = 600.0 => ATR% = 0.005. 2x ATR = 0.01
+        # Should be clamped to min 0.03.
+        self.bot.update_indicators(atr=3.0, adx=15.0)
+        self.bot.initialize_grid("BNB/USDT", 600.0)
+        
+        # Grid range should be 0.03
+        assert self.bot.state.grid_low == pytest.approx(582.0, rel=0.01)
+        assert self.bot.state.grid_high == pytest.approx(618.0, rel=0.01)
+
+    @patch("app.strategy.grid_bot.settings")
+    def test_atr_adaptive_sizing_clamped_max(self, ms):
+        ms.capital_per_grid = 10.0
+        ms.GRID_RANGE_PCT = 0.08
+        ms.GRID_MIN_RANGE_PCT = 0.03
+        ms.GRID_MAX_RANGE_PCT = 0.15
+        ms.TREND_ADX_THRESHOLD = 25.0
+        ms.GRID_LEVELS = 10
+        self.bot = GridBot(self.bus)
+        
+        # ATR = 90.0, Price = 600.0 => ATR% = 0.15. 2x ATR = 0.30
+        # Should be clamped to max 0.15.
+        self.bot.update_indicators(atr=90.0, adx=15.0)
+        self.bot.initialize_grid("BNB/USDT", 600.0)
+        
+        assert self.bot.state.grid_low == pytest.approx(510.0, rel=0.01)
+
+    @pytest.mark.asyncio
+    @patch("app.strategy.grid_bot.settings")
+    async def test_adx_trend_filter_blocks_initial_orders(self, ms):
+        ms.capital_per_grid = 10.0
+        ms.GRID_RANGE_PCT = 0.08
+        ms.GRID_MIN_RANGE_PCT = 0.03
+        ms.GRID_MAX_RANGE_PCT = 0.15
+        ms.TREND_ADX_THRESHOLD = 25.0
+        ms.GRID_LEVELS = 10
+        self.bot = GridBot(self.bus)
+        
+        # ADX = 30 (above 25 threshold)
+        self.bot.update_indicators(atr=30.0, adx=30.0)
+        self.bot.initialize_grid("BNB/USDT", 600.0)
+        
+        count = await self.bot.generate_initial_orders(600.0)
+        assert count == 0  # Should be blocked
+
